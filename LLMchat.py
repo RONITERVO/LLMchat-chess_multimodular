@@ -158,20 +158,6 @@ def select_latest_image():
 
     return str(latest_file)
 
-def graceful_exit(stream1, stream2, processing_thread, app):
-    """Handle graceful shutdown."""
-    print("\nExiting the application...")
-    if stream1:
-        stream1.stop()
-        stream1.close()
-    if stream2:
-        stream2.stop()
-        stream2.close()
-    if processing_thread and processing_thread.is_alive():
-        processing_thread.join(timeout=1)
-    app.destroy()
-    sys.exit(0)
-
 
 def load_config():
     config = {}  # Initialize config as an empty dictionary
@@ -263,41 +249,6 @@ def make_audio_callback(q):
         q.put(audio_data)
     return callback
 
-def reduce_noise_from_audio(audio_data, sample_rate):
-    """
-    Apply noise reduction techniques to improve audio quality in noisy environments.
-    
-    Args:
-        audio_data: numpy array of audio samples
-        sample_rate: sample rate of the audio
-    Returns:
-        noise_reduced_audio: processed audio with reduced background noise
-    """
-    try:
-        # Step 1: Apply noise reduction (spectral gating)
-        # Estimate noise from the first 500ms of audio (assuming it's mostly noise)
-        noise_sample = audio_data[:int(sample_rate * 0.5)] if len(audio_data) > sample_rate * 0.5 else audio_data
-        reduced_audio = nr.reduce_noise(
-            y=audio_data, 
-            sr=sample_rate,
-            stationary=False,  # Non-stationary noise (traffic, crowds)
-            prop_decrease=0.75  # Aggressive noise reduction for urban environments
-        )
-        
-        # Step 2: Apply bandpass filter to focus on speech frequencies (300-3400 Hz)
-        nyquist = 0.5 * sample_rate
-        low = 300 / nyquist
-        high = 3400 / nyquist
-        b, a = butter(4, [low, high], btype='band')
-        filtered_audio = filtfilt(b, a, reduced_audio)
-        
-        # Step 3: Normalize audio to improve volume consistency
-        filtered_audio = filtered_audio / (np.max(np.abs(filtered_audio)) + 1e-10)
-        
-        return filtered_audio
-    except Exception as e:
-        logging.error(f"Error in noise reduction: {e}")
-        return audio_data  # Return original audio if processing fails
 
 def process_audio_stream(stream_stop_event, app, selected_language, openai_api_key, openrouter_api_key, selected_model):
     """Process audio data from the active queue and handle relevant inputs."""
@@ -588,21 +539,6 @@ class ChatAudioApp5(tk.Tk):
 
         #Musiikin aikana mikki ei saa mennä päälle automaattisesti,  mutta alussa ei ole musiikkia, eli mikki voi käynnistyä puheen generoinnin jälkeen. 
         self.no_music_playback = True
-
-    def register_thread(self, thread, thread_name=None, daemon=True):
-        """Register a thread with the application for tracking and management."""
-        if thread_name:
-            thread.name = thread_name
-        thread.daemon = daemon
-        
-        with self.thread_lock:
-            self.active_threads.append({
-                'thread': thread,
-                'name': thread.name,
-                'start_time': datetime.now(),
-                'status': 'created'
-            })
-        return thread
 
     def start_thread(self, target, args=(), kwargs={}, thread_name=None, daemon=True):
         """Create, register and start a new thread with proper tracking."""
@@ -3367,58 +3303,61 @@ class ChatAudioApp5(tk.Tk):
                 # System message for UI feedback
                 self.append_message("Game over! To play again, restart the game.", sender="system")
 
-                
-            #Mark the game as ended
+            # Mark the game as ended
             self.chess_game_ended = True
             # Save the final game state with the ended flag
             self.save_chess_game_state()
 
-            self.selected_language = "en"
-            self.selected_language = self.language_var.get()
-            
-            response_json = self.send_message_to_openrouter(
-                context_messages,
-                image_path=None,
-                language=self.selected_language,
-                openrouter_api_key=self.openrouter_key,
-                model=self.model_var.get()
+            # Add a placeholder message for the assistant response
+            self.append_message("Thinking about the game outcome...", sender="assistant")
+
+            # Start a background thread to get the LLM response
+            self.start_thread(
+                target=self._background_game_over_response,
+                args=(context_messages,),
+                thread_name="GameOverResponseThread"
             )
 
-            if not response_json:
-                return
+    def _background_game_over_response(self, context_messages):
+        """Process the game over LLM response in a background thread using streaming"""
+        selected_language = self.language_var.get()
+        
+        # Use the streaming function to get the response
+        response_json = self.send_message_to_openrouter(
+            messages=context_messages,
+            image_path=None,
+            language=self.map_language_to_code(selected_language),
+            openrouter_api_key=self.openrouter_key,
+            model=self.model_var.get(),
+            reasoning_effort=self.reasoning_effort_var.get(),
+            show_reasoning=self.show_reasoning_var.get()
+        )
+
+        if not response_json:
+            return
+        
+        try:
+            assistant_response = response_json['choices'][0]['message']['content']
             
-            try:
-                assistant_response = response_json['choices'][0]['message']['content']
-                
-                # Look for image generation as in your other code
-                pattern = r"\[CREATE_IMAGE:\s*(.*?)\]"
-                match = re.search(pattern, assistant_response)
-                
-                if match:
-                    prompt_for_image = match.group(1).strip()
-                    cleaned_response = re.sub(pattern, '', assistant_response).strip()
-                    self.display_generated_image(prompt_for_image)
-                else:
-                    cleaned_response = assistant_response
-                
-                # Append the cleaned response to the chat window
-                self.append_message(cleaned_response, sender="assistant")
-                
-                # Add the original response to messages for context
-                messages.append({"role": "assistant", "content": assistant_response})
-                
-                # Speak the response
-                self.speak_text(cleaned_response)
-                
-                # Optional: Show a popup for game over
-                messagebox.showinfo("Game ended:")
-                
-                # Stop listening if appropriate
-                self.stop_listening()
-                
-            except (IndexError, KeyError) as e:
-                logging.error(f"Unexpected response format: {e}")
-                self.handle_error(f"Unexpected response format from LLM: {e}")
+            # Look for image generation
+            pattern = r"\[CREATE_IMAGE:\s*(.*?)\]"
+            match = re.search(pattern, assistant_response)
+            
+            if match:
+                prompt_for_image = match.group(1).strip()
+                cleaned_response = re.sub(pattern, '', assistant_response).strip()
+                # Use after() to update UI from background thread
+                self.after(0, lambda p=prompt_for_image: self.display_generated_image(p))
+            else:
+                cleaned_response = assistant_response
+            
+            # Add the original response to messages for context
+            global messages
+            messages.append({"role": "assistant", "content": assistant_response})
+            
+        except (IndexError, KeyError) as e:
+            logging.error(f"Unexpected response format: {e}")
+            self.after(0, lambda: self.handle_error(f"Unexpected response format from LLM: {e}"))
 
     
 
@@ -3625,6 +3564,7 @@ class ChatAudioApp5(tk.Tk):
                 "Don't try to make a move yourself yet - wait for them to make a clear move instruction."
             )
             
+            user_input += "\nImportant before we start chatting (dont mention that i said this to me in your response, I just need to let you know what is going on); if my last message looks like a move but isn't, please ignore it and continue chatting, maybe stating that there might be an error with how the system is processing user speech input and thus the move did not get recognized by the thess system. If it looks like small talk then i am trying to do small talk with you."
             # Create messages with context
             chess_context_messages = messages.copy()
             chess_context_messages.append({"role": "system", "content": chess_context_prompt})
