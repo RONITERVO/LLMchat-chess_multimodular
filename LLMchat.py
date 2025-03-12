@@ -11,7 +11,6 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 from num2words import num2words
 import re
 import queue
@@ -50,6 +49,10 @@ import chess  # pip install python-chess
 import chess.pgn
 from scipy.signal import resample
 import noisereduce as nr  # pip install noisereduce
+
+# Sorry for the mix of English and Finnish in commenting and code. 
+#I got help from LLM in the coding process, so the coding and commenting style changes sometimes, and the code is sometimes unorganized.
+# This is a work in progress, and I am fixing bugs and adding new features as often as possible. 
 
 # --------------------------- Configuration Parameters ---------------------------
 DEFAULT_VOL_THRESHOLD = 10  # Volume threshold for relevance
