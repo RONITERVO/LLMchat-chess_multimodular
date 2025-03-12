@@ -1,0 +1,12 @@
+{
+    "LLM_PERSONALITIES": {},
+    "MODELS_LIST": [
+        "openai/gpt-4o-2024-11-20",
+        "deepseek / deepseek - r1:freeopenai/o1-mini",
+        "openai/o1-preview",
+        "x-ai/grok-vision-beta",
+        "meta-llama/llama-3.2-90b-vision-instruct",
+        "openai/gpt-4o-mini",
+        "anthropic/claude-3.5-sonnet-20240620"
+    ]
+}
