@@ -1,4 +1,4 @@
-# LLMchat-chess_multimodular
+# LLMchat-chess_multimodular / LLMchat.py
 # LLM-Powered Multimodal Personal Assistant & Chess opponent
 
 This project is a versatile personal assistant and chess opponent powered by Large Language Models (LLMs). It combines voice interaction, text chat, task management, multimedia integration, and a fully functional chess interface.
