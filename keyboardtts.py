@@ -1,3 +1,6 @@
+#This is optional
+#allows typing if you need to type text in the app. The app is supposed to be fully voice interactive but this app allows you to input audio by generating speech from keyboard input by clicking enter to speak out the sentence. 
+
 import keyboard
 import pyttsx3
 from queue import Queue
