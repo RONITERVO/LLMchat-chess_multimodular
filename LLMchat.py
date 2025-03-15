@@ -11,6 +11,10 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+from threading import Thread, Event
+import tempfile
+import whisper
+import soundfile as sf
 from num2words import num2words
 import re
 import queue
@@ -50,14 +54,17 @@ import chess.pgn
 from scipy.signal import resample
 import noisereduce as nr  # pip install noisereduce
 
-# Sorry for the mix of English and Finnish in commenting and code. 
-#I got help from LLM in the coding process, so the coding and commenting style changes sometimes, and the code is sometimes unorganized.
-# This is a work in progress, and I am fixing bugs and adding new features as often as possible. 
+from gtts import gTTS
+from playsound import playsound
 
 # --------------------------- Configuration Parameters ---------------------------
 DEFAULT_VOL_THRESHOLD = 10  # Volume threshold for relevance
 DEFAULT_MIN_RECORD_DURATION = 2  # Minimum duration (in seconds) to trigger transcription
 DEFAULT_MAX_SILENCE_DURATION = 2  # Maximum allowed silence between segments (in seconds)
+
+
+GTTS_AVAILABLE = True
+
 
 CONFIG_FILE = "config.json"
 TASKS_FILE = "tasks.json"
@@ -782,6 +789,24 @@ class ChatAudioApp5(tk.Tk):
         )
         self.skip_tts_check.pack(side=tk.LEFT, padx=10)
 
+        self.skip_dalle_var = tk.BooleanVar(value=False)
+        self.skip_dalle_check = tk.Checkbutton(
+            controls_frame,
+            text="Skip DallE image responses (Text response only, no images from llm)",
+            justify=tk.LEFT,
+            variable=self.skip_dalle_var
+        )
+        self.skip_dalle_check.pack(side=tk.LEFT, padx=10)
+
+        self.skip_thinkoutloud_var = tk.BooleanVar(value=False)
+        self.skip_thinkoutloud_check = tk.Checkbutton(
+            controls_frame,
+            text="Dont speak thinking summary",
+            justify=tk.LEFT,
+            variable=self.skip_thinkoutloud_var
+        )
+        self.skip_thinkoutloud_check.pack(side=tk.LEFT, padx=10)
+
         self.add_model_button = tk.Button(controls_frame, text="Add Model", command=self.add_model, width=10)
         self.add_model_button.pack(side=tk.LEFT, padx=(5, 5))
         self.remove_model_button = tk.Button(controls_frame, text="Remove Model", command=self.remove_model, width=12)
@@ -1133,6 +1158,67 @@ class ChatAudioApp5(tk.Tk):
         # Load existing API keys/parameters
         self.load_existing_api_keys()
 
+
+        # --------------------- Local TTS Settings ---------------------
+        local_tts_frame = tk.LabelFrame(self.settings_inner_frame, text="Local Text-to-Speech", padx=10, pady=10)
+        local_tts_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+
+        # Use local TTS toggle
+        self.use_local_tts_var = tk.BooleanVar(value=self.config_data.get('USE_LOCAL_TTS', False))
+        self.use_local_tts_check = tk.Checkbutton(
+            local_tts_frame,
+            text="Use local TTS (instead of OpenAI API)",
+            variable=self.use_local_tts_var,
+            command=self.toggle_local_tts_settings
+        )
+        self.use_local_tts_check.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        # Local TTS language selection
+        self.gtts_lang_label = tk.Label(local_tts_frame, text="TTS Language:")
+        self.gtts_lang_label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
+
+        self.gtts_lang_var = tk.StringVar(value=self.config_data.get('GTTS_LANGUAGE', 'en'))
+        self.gtts_lang_combobox = ttk.Combobox(
+            local_tts_frame,
+            textvariable=self.gtts_lang_var,
+            state="readonly" if self.use_local_tts_var.get() else "disabled",
+            width=20,
+            values=["en", "fi", "sv", "es", "fr", "de", "it", "ja", "ko", "zh-CN", "ru"]
+        )
+        self.gtts_lang_combobox.grid(row=1, column=1, sticky="w", padx=5, pady=5)
+
+        # Check if gTTS is available
+        gtts_status = "Available" if GTTS_AVAILABLE else "Not installed - run 'pip install gtts playsound==1.2.2'"
+        self.gtts_status_label = tk.Label(
+            local_tts_frame,
+            text=f"gTTS Status: {gtts_status}",
+            fg="green" if GTTS_AVAILABLE else "red"
+        )
+        self.gtts_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        # Language descriptions
+        lang_desc = (
+            "en: English\nfi: Finnish\nsv: Swedish\nes: Spanish\nfr: French\n"
+            "de: German\nit: Italian\nja: Japanese\nko: Korean\nzh-CN: Chinese\nru: Russian"
+        )
+        desc_label = tk.Label(
+            local_tts_frame,
+            text=lang_desc,
+            font=("TkDefaultFont", 8),
+            fg="gray",
+            justify="left"
+        )
+        desc_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        # Save button
+        self.save_local_tts_button = tk.Button(
+            local_tts_frame,
+            text="Save Local TTS Settings",
+            command=self.save_local_tts_settings,
+            width=20
+        )
+        self.save_local_tts_button.grid(row=4, column=0, columnspan=2, pady=10)        
+
         # --------------------- Mureka API Settings ---------------------
         mureka_frame = tk.LabelFrame(self.settings_inner_frame, text="Mureka API Settings", padx=10, pady=10)
         mureka_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
@@ -1162,6 +1248,85 @@ class ChatAudioApp5(tk.Tk):
         self.save_mureka_keys_button = tk.Button(mureka_frame, text="Save Mureka Keys", command=self.save_mureka_keys,
                                                  width=20)
         self.save_mureka_keys_button.grid(row=3, column=0, columnspan=2, pady=10)
+
+        # --------------------- Whisper Configuration ---------------------
+        whisper_frame = tk.LabelFrame(self.settings_inner_frame, text="Speech Recognition Settings", padx=10, pady=10)
+        whisper_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+
+        # Use local Whisper model toggle
+        self.use_local_whisper_var = tk.BooleanVar(value=self.config_data.get('USE_LOCAL_WHISPER', False))
+        self.use_local_whisper_check = tk.Checkbutton(
+            whisper_frame,
+            text="Use local Whisper model (instead of OpenAI API)",
+            variable=self.use_local_whisper_var,
+            command=self.toggle_whisper_settings
+        )
+        self.use_local_whisper_check.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        # Local Whisper model selection
+        self.whisper_model_label = tk.Label(whisper_frame, text="Local Whisper Model:")
+        self.whisper_model_label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
+
+        self.whisper_model_var = tk.StringVar(value=self.config_data.get('WHISPER_MODEL', 'base'))
+        self.whisper_model_combobox = ttk.Combobox(
+            whisper_frame,
+            textvariable=self.whisper_model_var,
+            state="readonly",
+            width=20,
+            values=["tiny", "base", "small", "medium", "large"]
+        )
+        self.whisper_model_combobox.grid(row=1, column=1, sticky="w", padx=5, pady=5)
+
+        # Add a status label
+        self.whisper_status_label = tk.Label(
+            whisper_frame, 
+            text="Status: Not loaded", 
+            fg="blue"
+        )
+        self.whisper_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        # Model description
+        model_desc = (
+            "tiny: Fastest, least accurate (1GB)\n"
+            "base: Fast, good accuracy (1GB)\n"
+            "small: Balanced (2GB)\n"
+            "medium: Good quality (5GB)\n"
+            "large: Best quality, slowest (10GB)\n"
+            "Requires more RAM for larger models"
+        )
+
+        # Add this after the model description in the whisper_frame
+
+        usage_label = tk.Label(
+            whisper_frame,
+            text="Note: Local Whisper requires the 'whisper' package.\nInstall with: pip install openai-whisper",
+            font=("TkDefaultFont", 8, "italic"),
+            fg="blue",
+            justify="left"
+        )
+        usage_label.grid(row=5, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        desc_label = tk.Label(
+            whisper_frame,
+            text=model_desc,
+            font=("TkDefaultFont", 8),
+            fg="gray",
+            justify="left"
+        )
+        desc_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        # Save button
+        self.save_whisper_button = tk.Button(
+            whisper_frame,
+            text="Save & Load Whisper Settings",
+            command=self.save_whisper_settings,
+            width=25
+        )
+        self.save_whisper_button.grid(row=4, column=0, columnspan=2, pady=10)
+
+        # Set initial state based on saved setting
+        self.whisper_model = None
+        self.toggle_whisper_settings()
 
         # --------------------- Added Audio Source 1 and 2 Selection ---------------------
         # Audio Source 1 Selection
@@ -1381,7 +1546,88 @@ class ChatAudioApp5(tk.Tk):
             self.mureka_token_entry.config(show="*")  # Varmistetaan, että Entry näyttää tähdet
 
         
+    def toggle_local_tts_settings(self):
+        """Enable or disable local TTS settings based on checkbox state"""
+        state = "normal" if self.use_local_tts_var.get() else "disabled"
+        self.gtts_lang_combobox.config(state=state)
 
+    def save_local_tts_settings(self):
+        """Save local TTS settings to config file"""
+        use_local = self.use_local_tts_var.get()
+        lang = self.gtts_lang_var.get()
+        
+        self.config_data['USE_LOCAL_TTS'] = use_local
+        self.config_data['GTTS_LANGUAGE'] = lang
+        
+        # Save to config file
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config_data, f, indent=4)
+        
+        if use_local and not GTTS_AVAILABLE:
+            messagebox.showwarning(
+                "Package Missing", 
+                "gTTS is not installed. Please run 'pip install gtts playsound==1.2.2' to use local TTS."
+            )
+        else:
+            messagebox.showinfo("Settings Saved", "Local TTS settings saved successfully.")
+
+
+    def generate_local_tts(self, text, language=None):
+        """Generate speech using local gTTS and return the audio file path"""
+        if not GTTS_AVAILABLE:
+            self.append_message("Error: gTTS not installed. Run 'pip install gtts playsound==1.2.2'", sender="system")
+            return None
+        
+        try:
+            # Create a temporary file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+            temp_file.close()
+            
+            # Use specified language or default from settings
+            lang = language or self.gtts_lang_var.get()
+            
+            # Generate speech
+            self.update_status("Generating speech with gTTS...")
+            tts = gTTS(text=text, lang=lang, slow=False)
+            tts.save(temp_file.name)
+            
+            return temp_file.name
+        except Exception as e:
+            error_msg = f"Error generating local TTS: {str(e)}"
+            logging.error(error_msg)
+            self.append_message(error_msg, sender="system")
+            return None
+
+    def play_local_audio(self, audio_file):
+        """Play a local audio file with error handling"""
+        try:
+            self.update_status("Playing audio...")
+            
+            # Store current audio source state and mute
+            self.audio_source_toggle_var.set("mute")
+            
+            # Play the audio
+            playsound(audio_file)
+            
+            # Clean up the file afterwards
+            try:
+                os.unlink(audio_file)
+            except:
+                pass
+            
+            # Restore original audio state
+            if hasattr(self, 'saved_audio_state'):
+                self.audio_source_toggle_var.set(self.saved_audio_state)
+            
+            self.update_status("Audio playback completed")
+        except Exception as e:
+            error_msg = f"Error playing audio: {str(e)}"
+            logging.error(error_msg)
+            self.append_message(error_msg, sender="system")
+            
+            # Ensure we restore audio state even on error
+            if hasattr(self, 'saved_audio_state'):
+                self.audio_source_toggle_var.set(self.saved_audio_state)
 
     def browse_image_path(self):
         """Let the user pick a default image directory."""
@@ -1483,6 +1729,15 @@ class ChatAudioApp5(tk.Tk):
 
     def start_listening(self):
         try:
+            # Check if using local Whisper but model isn't loaded
+            if self.use_local_whisper_var.get() and not self.whisper_model:
+                self.append_message("Loading local Whisper model first...", sender="system")
+                # Load the model before starting to listen
+                self.load_whisper_model()
+                # Wait a moment to let the loading start
+                time.sleep(1)
+            
+            # Rest of the existing start_listening code
             if not self.api_keys_provided:
                 messagebox.showerror("Error", "API keys are not set. Please enter and save your API keys first.")
                 return
@@ -1622,6 +1877,118 @@ class ChatAudioApp5(tk.Tk):
             logging.error(f"Failed to stop listening: {e}")
             messagebox.showerror("Error", f"Failed to stop listening: {e}")
             self.append_message(f"Failed to stop listening: {e}", sender="system")
+
+
+
+    # Add these methods to ChatAudioApp5 class
+    def toggle_whisper_settings(self):
+        """Enable or disable Whisper model settings based on checkbox state"""
+        state = "normal" if self.use_local_whisper_var.get() else "disabled"
+        self.whisper_model_combobox.config(state=state)
+        self.whisper_status_label.config(
+            text="Status: Not loaded" if not self.use_local_whisper_var.get() else "Status: Ready to load"
+        )
+
+    def save_whisper_settings(self):
+        """Save Whisper settings and load model if local Whisper is enabled"""
+        use_local = self.use_local_whisper_var.get()
+        model_size = self.whisper_model_var.get()
+        
+        self.config_data['USE_LOCAL_WHISPER'] = use_local
+        self.config_data['WHISPER_MODEL'] = model_size
+        
+        # Save to config file
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config_data, f, indent=4)
+        
+        # Load model if enabled
+        if use_local:
+            self.load_whisper_model()
+        else:
+            self.whisper_model = None
+            self.whisper_status_label.config(text="Status: Using OpenAI API")
+        
+        messagebox.showinfo("Settings Saved", "Whisper settings saved successfully.")
+
+    def load_whisper_model(self):
+        """Load the selected Whisper model in a background thread"""
+        self.whisper_status_label.config(text="Status: Loading model...", fg="orange")
+        self.update_idletasks()
+        
+        # Start loading in a background thread to prevent UI freezing
+        self.start_thread(
+            target=self._background_load_whisper_model,
+            thread_name="WhisperModelLoader"
+        )
+
+    def _background_load_whisper_model(self):
+        """Load Whisper model in background thread"""
+        model_size = self.whisper_model_var.get()
+        try:
+            # Update status on the main thread
+            self.after(0, lambda: self.whisper_status_label.config(
+                text=f"Status: Loading {model_size} model...", 
+                fg="orange"
+            ))
+            
+            # Load the model (this may take time depending on model size)
+            self.whisper_model = whisper.load_model(model_size)
+            
+            # Update status on success
+            self.after(0, lambda: self.whisper_status_label.config(
+                text=f"Status: {model_size} model loaded successfully", 
+                fg="green"
+            ))
+            self.append_message(f"Local Whisper {model_size} model loaded successfully", sender="system")
+            
+        except Exception as e:
+            error_msg = f"Failed to load Whisper model: {str(e)}"
+            logging.error(error_msg)
+            
+            # Update status on error
+            self.after(0, lambda: self.whisper_status_label.config(
+                text=f"Status: Failed to load model", 
+                fg="red"
+            ))
+            self.append_message(f"Error loading Whisper model: {str(e)}", sender="system")    
+
+
+    # Add this method to the ChatAudioApp5 class
+
+    def process_transcription(self, transcript, client, openrouter_api_key, selected_model):
+        """Process transcribed text and determine appropriate action based on content."""
+        try:
+            # Display user's message in the chat
+            self.append_message(transcript, sender="user")
+            
+            # Some preprocessing of user input
+            user_input = self._add_pdf_content_if_exists(transcript)
+            
+            # Get image path if needed
+            image_path = None
+            if self.send_image_var.get():
+                image_path = select_latest_image()
+            
+            # Get current game mode
+            current_game = self.game_var.get()
+            
+            # Process based on the current context/mode
+            if "generate music" in user_input.lower() or "create song" in user_input.lower():
+                self._handle_music_generation(user_input)
+            elif current_game == "Chess" and self.chess_board and not self.chess_game_ended:
+                self._handle_chess_input(user_input, selected_language=self.map_language_to_code(self.language_var.get()), 
+                                        openrouter_api_key=openrouter_api_key, 
+                                        selected_model=selected_model, 
+                                        image_path=image_path)
+            else:
+                self._handle_normal_chat(user_input, selected_language=self.map_language_to_code(self.language_var.get()), 
+                                        openrouter_api_key=openrouter_api_key, 
+                                        selected_model=selected_model, 
+                                        image_path=image_path)
+        except Exception as e:
+            error_msg = f"Error processing transcription: {str(e)}"
+            logging.error(error_msg)
+            self.handle_error(error_msg)
 
     # --------------------------- Chess UI ---------------------------
     def create_chess_frame(self, parent):
@@ -2821,6 +3188,30 @@ class ChatAudioApp5(tk.Tk):
             model_name = model.replace("ollama/", "", 1)
             print(f"Using Ollama model: {model_name}")
             
+            # Process image path if provided
+            if image_path is not None:
+                # Create a copy of messages to avoid modifying the original list
+                modified_messages = [msg.copy() for msg in messages]
+                last_user_msg_idx = -1
+                # Find the last user message
+                for i in reversed(range(len(modified_messages))):
+                    if modified_messages[i].get('role') == 'user':
+                        last_user_msg_idx = i
+                        break
+                if last_user_msg_idx != -1:
+                    # Add the image to the existing user message
+                    if 'images' not in modified_messages[last_user_msg_idx]:
+                        modified_messages[last_user_msg_idx]['images'] = []
+                    modified_messages[last_user_msg_idx]['images'].append(image_path)
+                else:
+                    # Append a new user message with the image
+                    modified_messages.append({
+                        'role': 'user',
+                        'content': '',  # Default content if none provided
+                        'images': [image_path]
+                    })
+                messages = modified_messages
+            
             # Initialize the client
             ollama_client = ollama.Client()
             
@@ -3057,7 +3448,7 @@ class ChatAudioApp5(tk.Tk):
         current_game = self.game_var.get()
 
         # Prepare game-specific personality prompt
-        if current_game != "Chess":
+        if current_game != "Chess" and not self.skip_dalle_var.get():
             image_generation_instruction = (
                 "\nIf you feel like providing image or in case user says something like ...I would like to see an image of... "
                 "just include description of the image in English (ENGLISH!) on the last line of your reply like this: \n"
@@ -3417,31 +3808,68 @@ class ChatAudioApp5(tk.Tk):
                     # Mark speech as in progress
                     self.speech_in_progress.set()
                     
-                    # Use TTS API
-                    stream_params = {
-                        "api_key": self.openai_key,
-                        "text": text_with_spoken_numbers,
-                        "device_id": device_id,
-                    }
-                    
-                    def check_stop_signal(chunk, is_first):
-                        # Return whether to continue streaming
-                        return not self.thinking_tts_should_stop.is_set()
-                    
-                    # This will block until the speech is complete
-                    self.stream_api_response(
-                        "tts", 
-                        stream_params, 
-                        check_stop_signal
-                    )
-                    
-                    last_speech_time = time.time()
+                    # Check if we should use local TTS
+                    if self.config_data.get('USE_LOCAL_TTS', False) and GTTS_AVAILABLE:
+                        # Use local gTTS
+                        audio_file = self.generate_local_tts(
+                            text_with_spoken_numbers, 
+                            language=self.config_data.get('GTTS_LANGUAGE', 'en')
+                        )
+                        
+                        if audio_file:
+                            # Check for stop signal before playing
+                            if not self.thinking_tts_should_stop.is_set():
+                                # Save current audio state and mute
+                                original_state = self.audio_source_toggle_var.get()
+                                self.audio_source_toggle_var.set("mute")
+                                
+                                # Play the audio file
+                                try:
+                                    playsound(audio_file)
+                                    
+                                    # Clean up file after playing
+                                    try:
+                                        os.unlink(audio_file)
+                                    except:
+                                        pass
+                                except Exception as e:
+                                    logging.error(f"Error playing thinking TTS audio: {e}")
+                                finally:
+                                    # Restore audio state
+                                    self.audio_source_toggle_var.set(original_state)
+                            
+                            last_speech_time = time.time()
+                            self.speech_in_progress.clear()
+                        else:
+                            # If generation failed, skip speaking
+                            self.speech_in_progress.clear()
+                            logging.error("Failed to generate local TTS audio for thinking")
+                    else:
+                        # Use API-based TTS
+                        stream_params = {
+                            "api_key": self.openai_key,
+                            "text": text_with_spoken_numbers,
+                            "device_id": device_id,
+                        }
+                        
+                        def check_stop_signal(chunk, is_first):
+                            # Return whether to continue streaming
+                            return not self.thinking_tts_should_stop.is_set()
+                        
+                        # This will block until the speech is complete
+                        self.stream_api_response(
+                            "tts", 
+                            stream_params, 
+                            check_stop_signal
+                        )
+                        
+                        last_speech_time = time.time()
+                        
+                        # Mark speech as complete
+                        self.speech_in_progress.clear()
                     
                     # Add a small pause after speech to ensure clean transition
                     time.sleep(0.3)
-                    
-                    # Mark speech as complete
-                    self.speech_in_progress.clear()
                     
                     # Add a longer pause after final speech
                     if is_final:
@@ -3476,6 +3904,7 @@ class ChatAudioApp5(tk.Tk):
         # Signal end
         self.thinking_tts_queue.put(None)
     
+    # Replace the existing _tts_worker method
     def _tts_worker(self, tts_queue):
         """Modified worker that handles TTS with automatic muting and unmuting."""
         
@@ -3497,6 +3926,8 @@ class ChatAudioApp5(tk.Tk):
 
             try:
                 self.tts_queue_completed = False  # Reset flag
+            
+
                 # Store current audio source state and mute
                 print("muted by tts")
                 self.audio_source_toggle_var.set("mute")
@@ -3505,35 +3936,47 @@ class ChatAudioApp5(tk.Tk):
                 selected_language = self.map_language_to_code(self.language_var.get())
 
                 if selected_language != "en":
-                    # Convert numbers to spoken words for OTHER LANGUAGES THAN ENGLISH FOR TTS, because it will not handle numbers correctly in other languages. Additionally "=, and other markers are poorly handled in other than English, but this does not fix that".
+                    # Convert numbers to spoken words for languages other than English
                     text_with_spoken_numbers = self.convert_numbers_to_words(text, selected_language)
                 else:
                     text_with_spoken_numbers = text
                 
+                # Check if we should use local TTS
+                if self.config_data.get('USE_LOCAL_TTS', False) and GTTS_AVAILABLE:
+                    # Use local gTTS
+                    audio_file = self.generate_local_tts(
+                        text_with_spoken_numbers, 
+                        language=self.config_data.get('GTTS_LANGUAGE', 'en')
+                    )
+                    
+                    if audio_file:
+                        self.play_local_audio(audio_file)
+                        self.tts_queue_completed = True
+                else:
+                    # Use API-based TTS (existing implementation)
+                    # Get output device
+                    selected_output_index = self.audio_output_combobox.current()
+                    device_id = None
+                    if selected_output_index >= 0 and self.available_output_devices:
+                        _, device_id = self.available_output_devices[selected_output_index]
 
-                # Get output device
-                selected_output_index = self.audio_output_combobox.current()
-                device_id = None
-                if selected_output_index >= 0 and self.available_output_devices:
-                    _, device_id = self.available_output_devices[selected_output_index]
+                    # Use stream API for TTS with blocking until complete
+                    self.stream_api_response(
+                        api_type = "tts",
+                        request_params = {
+                            "api_key": self.openai_key,
+                            "text": text_with_spoken_numbers,
+                            "device_id": device_id,
+                        },
+                        on_chunk_received = lambda chunk, first: None,
+                        on_complete = None
+                    )
 
-                # Use stream API for TTS with blocking until complete
-                self.stream_api_response(
-                    api_type = "tts",
-                    request_params = {
-                        "api_key": self.openai_key,
-                        "text": text_with_spoken_numbers,
-                        "device_id": device_id,
-                    },
-                    on_chunk_received = lambda chunk, first: None,
-                    on_complete = None
-                )
-
-                print("full TTS playback complete")
-                self.tts_queue_completed = True  # Set flag in finally block
+                    print("full TTS playback complete")
+                    self.tts_queue_completed = True
 
                 def unmute_after_tts():
-                    if self.current_tts_stream_completed:
+                    if self.current_tts_stream_completed or self.tts_queue_completed:
                         # Reset listening queues before unmuting
                         while not self.audio_queue1.empty():
                             self.audio_queue1.get()
@@ -3548,7 +3991,7 @@ class ChatAudioApp5(tk.Tk):
                     else:
                         self.after(1000, unmute_after_tts)
                 self.after(1000, unmute_after_tts)
-                
+                    
             except Exception as e:
                 logging.error(f"Error during TTS processing: {e}")
                 self.after(0, lambda: self.append_message(f"Error during TTS: {e}", sender='system'))
@@ -3808,58 +4251,94 @@ class ChatAudioApp5(tk.Tk):
         ttk.Label(reasoning_frame, text=help_text, font=("TkDefaultFont", 8), 
                 foreground="gray").grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
-    def save_and_process_audio(self, recorded_frames, selected_language, client, openrouter_api_key, selected_model):
-        """
-        Save recorded frames, transcribe, and process through LLM based on context.
-        """
-        self.ai_tried_chess_move = False
-        self.chess_game_ended = False
-        image_path = None
-        
-        # Save audio data to file
-        try:
-            recorded_audio = np.concatenate(recorded_frames, axis=0)
-            wavio.write(RECORDED_AUDIO_PATH, recorded_audio, rate=self.sample_rate1, sampwidth=2)
-            self.update_status("Voice input saved")
-            self.append_message(f"Tallennettu ääni: {RECORDED_AUDIO_PATH}", "system")
-            logging.info(f"Recording saved to {RECORDED_AUDIO_PATH}")
-        except Exception as e:
-            logging.error(f"Error saving recorded audio: {e}")
-            self.handle_error(f"Error saving recorded audio: {e}")
-            return
+    # Update the save_and_process_audio method to use local Whisper when enabled
+# Replace the existing save_and_process_audio method with this improved version
 
-        # Transcribe audio using Whisper
+    def save_and_process_audio(self, recorded_frames, selected_language, client, openrouter_api_key, selected_model):
+        """Save recorded audio to file and process it with either OpenAI API or local Whisper"""
         try:
-            user_input = self._transcribe_audio(client, selected_language)
-            if not user_input:
-                return
-        except Exception as e:
-            logging.error(f"Error during transcription: {e}")
-            self.handle_error(f"Transcription error: {e}")
-            return
-        
-        # Check for attached PDF content
-        user_input = self._add_pdf_content_if_exists(user_input)
-        
-        # Check if user wants music generation
-        if self.wants_pop_song(user_input):
-            self._handle_music_generation(user_input)
-            return
+            self.update_status("Processing audio...")
             
-        # Process based on current game mode
-        current_game = self.game_var.get()
-        
-        # Handle image if not in chess mode
-        if current_game != "Chess" and self.send_image_var.get():
-            image_path = select_latest_image()
-            if image_path:
-                self.append_image_in_chat(image_path, sender="user")
+            # Handle different array types and convert to int16
+            if isinstance(recorded_frames[0], np.ndarray):
+                audio_data = np.concatenate(recorded_frames, axis=0)
+            else:
+                # Convert from bytes to numpy array if needed
+                audio_arrays = []
+                for frame in recorded_frames:
+                    audio_arrays.append(np.frombuffer(frame, dtype=np.int16))
+                audio_data = np.concatenate(audio_arrays)
+            
+            # Save to temporary WAV file
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+                temp_filename = temp_wav.name
                 
-        # Process based on game mode
-        if current_game == "Chess":
-            self._handle_chess_input(user_input, selected_language, openrouter_api_key, selected_model, image_path)
-        else:
-            self._handle_normal_chat(user_input, selected_language, openrouter_api_key, selected_model, image_path)
+            wf = wave.open(temp_filename, 'wb')
+            wf.setnchannels(1)  # Assuming mono recording
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(self.sample_rate1)  # Use the sample rate from the recording
+            wf.writeframes(audio_data.tobytes())
+            wf.close()
+            
+            self.update_status("Transcribing audio...")
+            
+            # Check if we should use local Whisper or OpenAI API
+            if self.use_local_whisper_var.get() and self.whisper_model:
+                # Use local Whisper model
+                try:
+                    result = self.whisper_model.transcribe(temp_filename, language=selected_language)
+                    transcript = result["text"].strip()
+                    
+                    # Log and validate the transcription
+                    logging.info(f"Local Whisper transcription: '{transcript}'")
+                    
+                    if is_valid_transcription(transcript, blacklist=self.excluded_phrases):
+                        self.update_status("Processing transcription...")
+                        self.process_transcription(transcript, client, openrouter_api_key, selected_model)
+                    else:
+                        logging.info(f"Transcription filtered: '{transcript}'")
+                        self.update_status("Listening...")
+                except Exception as e:
+                    error_msg = f"Local Whisper transcription error: {str(e)}"
+                    logging.error(error_msg)
+                    self.handle_error(error_msg)
+                    self.update_status("Listening...")
+            else:
+                # Use OpenAI API (existing code)
+                try:
+                    with open(temp_filename, "rb") as audio_file:
+                        transcript = client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=audio_file,
+                            language=selected_language
+                        ).text
+                    
+                    # Log and validate the transcription
+                    logging.info(f"OpenAI API transcription: '{transcript}'")
+                    
+                    if is_valid_transcription(transcript, blacklist=self.excluded_phrases):
+                        self.update_status("Processing transcription...")
+                        self.process_transcription(transcript, client, openrouter_api_key, selected_model)
+                    else:
+                        logging.info(f"Transcription filtered: '{transcript}'")
+                        self.update_status("Listening...")
+                except Exception as e:
+                    error_msg = f"OpenAI API transcription error: {str(e)}"
+                    logging.error(error_msg)
+                    self.handle_error(error_msg)
+                    self.update_status("Listening...")
+            
+            # Clean up temporary file
+            try:
+                os.unlink(temp_filename)
+            except:
+                pass
+                
+        except Exception as e:
+            error_msg = f"Error processing audio: {str(e)}"
+            logging.error(error_msg)
+            self.handle_error(error_msg)
+            self.update_status("Listening...")
 
     def _transcribe_audio(self, client, selected_language):
         """Transcribe audio file and validate result"""
@@ -4809,15 +5288,28 @@ class ChatAudioApp5(tk.Tk):
         except (IndexError, KeyError) as e:
             self.handle_error(f"Error processing personality prompt: {e}")
 
+    # Add to the check_api_keys method to modify check when local Whisper is used
     def check_api_keys(self):
-        if hasattr(self, 'openai_key') and hasattr(self, 'openrouter_key'):
+        """Check if API keys are available and set flag"""
+        self.openai_key = self.config_data.get('OPENAI_API_KEY', '')
+        self.openrouter_key = self.config_data.get('OPENROUTER_API_KEY', '')
+        
+        # If using local Whisper, we only need OpenRouter key for LLM
+        if self.use_local_whisper_var.get():
+            if self.openrouter_key:
+                self.api_keys_provided = True
+                logging.info("Using local Whisper with OpenRouter key")
+            else:
+                self.api_keys_provided = False
+                messagebox.showerror("Error", "OpenRouter API key is required for LLM.")
+        else:
+            # Otherwise we need both OpenAI and OpenRouter keys
             if self.openai_key and self.openrouter_key:
                 self.api_keys_provided = True
-                self.append_message("API keys already loaded from config.", sender="system")
-                return
-
-        self.api_keys_provided = False
-        self.append_message("Please enter your API keys and click 'Save API Keys' to start.", sender="system")
+                logging.info("Both API keys loaded")
+            else:
+                self.api_keys_provided = False
+                messagebox.showerror("Error", "Both OpenAI and OpenRouter API keys must be provided.")
 
     def add_model(self):
         def save_new_model():
@@ -5602,9 +6094,12 @@ class ChatAudioApp5(tk.Tk):
 
         # Mark task as completed and update UI
         def check_llm_tts_completion():
-            if self.tts_queue_completed and self.current_tts_stream_completed:
-                # Generate music as a completion reward after a short delay
-                self.after(2000, lambda: self.generate_and_play_music(task['description'], is_task=True))
+            if self.tts_queue_completed:
+                time.sleep(5)
+                if self.tts_queue_completed:
+                    self.after(0, lambda: self.generate_and_play_music(task['description'], is_task=True))
+                else:
+                    self.after(2000, check_llm_tts_completion)
             else:
                 self.after(2000, check_llm_tts_completion)                                 
         
