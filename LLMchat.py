@@ -11,6 +11,10 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+from threading import Thread, Event
+import tempfile
+import whisper
+import soundfile as sf
 from num2words import num2words
 import re
 import queue
@@ -50,14 +54,15 @@ import chess.pgn
 from scipy.signal import resample
 import noisereduce as nr  # pip install noisereduce
 
-# Sorry for the mix of English and Finnish in commenting and code. 
-#I got help from LLM in the coding process, so the coding and commenting style changes sometimes, and the code is sometimes unorganized.
-# This is a work in progress, and I am fixing bugs and adding new features as often as possible. 
+from gtts import gTTS
+from playsound import playsound
 
 # --------------------------- Configuration Parameters ---------------------------
 DEFAULT_VOL_THRESHOLD = 10  # Volume threshold for relevance
 DEFAULT_MIN_RECORD_DURATION = 2  # Minimum duration (in seconds) to trigger transcription
 DEFAULT_MAX_SILENCE_DURATION = 2  # Maximum allowed silence between segments (in seconds)
+
+GTTS_AVAILABLE = True
 
 CONFIG_FILE = "config.json"
 TASKS_FILE = "tasks.json"
@@ -88,8 +93,6 @@ messages = []
 # Initialize Queues for Audio Data
 audio_queue1 = queue.Queue()  # Queue for Audio Source 1
 audio_queue2 = queue.Queue()  # Queue for Audio Source 2
-
-
 
 LANGUAGE_PROMPTS_FEN = {
 
@@ -178,7 +181,6 @@ def select_latest_image():
 
     return str(latest_file)
 
-
 def load_config():
     config = {}  # Initialize config as an empty dictionary
     if os.path.exists(CONFIG_FILE):
@@ -220,7 +222,6 @@ def load_config():
         config['MUREKA_API_TOKEN'] = ''
 
     return config
-
 
 def save_config(config):
     """Save API keys, default image directory, blacklist, and models list to config file."""
@@ -270,7 +271,6 @@ def make_audio_callback(q):
         audio_data = indata.copy()
         q.put(audio_data)
     return callback
-
 
 def process_audio_stream(stream_stop_event, app, selected_language, openai_api_key, openrouter_api_key, selected_model):
     """Process audio data from the active queue and handle relevant inputs."""
@@ -437,7 +437,6 @@ class TaskManager:
                 due.append(task)
         return due
         
-    # New methods to handle completed tasks and deletion
     def get_all_tasks(self):
         """Return all tasks (both completed and incomplete)"""
         return self.tasks
@@ -458,9 +457,9 @@ class TaskManager:
             return True
         return False
 
-
 # --------------------------- Tkinter User Interface ---------------------------
 class ChatAudioApp5(tk.Tk):
+    #-------------------Initialization & Core App Lifecycle----------------------
     def __init__(self):
         super().__init__()
         self.active_threads = []
@@ -612,11 +611,6 @@ class ChatAudioApp5(tk.Tk):
 
         self.after(1000, self.start_listening)  # 1-second delay to ensure UI is ready
 
-
-
-
-
-
     def start_thread(self, target, args=(), kwargs={}, thread_name=None, daemon=True):
         """Create, register and start a new thread with proper tracking."""
         thread = threading.Thread(target=target, args=args, kwargs=kwargs)
@@ -690,7 +684,46 @@ class ChatAudioApp5(tk.Tk):
         """
         self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox("all"))
 
-    # --------------------------- Create Main Tab ---------------------------
+    def on_closing(self):
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            try:
+                self.update_status("Shutting down...")
+                
+                # Save chess game state
+                self.save_chess_game_state()
+                
+                # Stop all streaming and processing
+                self.stream_stop_event.set()
+                
+                # Stop audio streams
+                if self.stream1:
+                    self.stream1.stop()
+                    self.stream1.close()
+                    self.stream1 = None
+                
+                if self.stream2:
+                    self.stream2.stop()
+                    self.stream2.close()
+                    self.stream2 = None
+                
+                # Clean up all threads
+                self.cleanup_threads()
+                
+                # Final cleanup
+                self.destroy()
+                sys.exit(0)
+            except Exception as e:
+                logging.error(f"Error during exit: {e}")
+                self.destroy()
+                sys.exit(1)
+
+    def handle_error(self, error_message):
+        user_message = f"An error occurred: {error_message}. Restarting the conversation."
+        self.append_message(user_message, sender="system")
+        self.update_status("Error encountered")
+        self.reset_conversation()
+
+    # --------------------------- UI Creation & Setup ---------------------------
     def create_main_tab(self):
         # Create a horizontal PanedWindow for resizable panes
         self.paned_window = ttk.PanedWindow(self.main_tab, orient=tk.HORIZONTAL)
@@ -721,93 +754,97 @@ class ChatAudioApp5(tk.Tk):
         self.right_frame = tk.Frame(self.paned_window)
         self.paned_window.add(self.right_frame, weight=1)  # Weight allows resizing
 
-        # Controls frame (model selection + buttons)
+        # Controls frame (model selection + buttons) - Using Grid Layout
         controls_frame = tk.Frame(self.right_frame)
         controls_frame.pack(fill=tk.X, padx=10, pady=5)
+        controls_frame.columnconfigure(1, weight=1) # Allow combobox column to expand
 
-        self.thread_monitor_button = tk.Button(
-            controls_frame,
-            text="Show Active Threads",
-            command=self.show_active_threads,
-            width=15,
-            bg="#007BFF",
-            fg="white"
-        )
-        self.thread_monitor_button.pack(side=tk.LEFT, padx=(10, 0))
-
-        self.app2_button = tk.Button(
-            controls_frame,
-            text="Open PDF Tool",
-            command=self.launch_app2,
-            bg="#4CAF50",
-            fg="white"
-        )
-        self.app2_button.pack(side=tk.RIGHT, padx=5)
-
-        self.app3_button = tk.Button(
-            controls_frame,
-            text="Open keyboard tts",
-            command=self.launch_app3,
-            bg="#4CAF50",
-            fg="white"
-        )
-        self.app3_button.pack(side=tk.LEFT, padx=5)
-
+        # --- Row 0: Model Selection ---
         model_label = tk.Label(controls_frame, text="Select LLM Model:", anchor="w")
-        model_label.pack(side=tk.LEFT, padx=(0, 10))
+        model_label.grid(row=0, column=0, padx=(0, 5), pady=5, sticky="w")
 
         self.model_var = tk.StringVar()
         self.model_combobox = ttk.Combobox(controls_frame, textvariable=self.model_var, state="readonly", width=30)
         self.model_combobox['values'] = self.models_list
         if self.models_list:
             self.model_combobox.current(0)
-        self.model_combobox.pack(side=tk.LEFT, padx=(0, 10))
+        self.model_combobox.grid(row=0, column=1, padx=(0, 5), pady=5, sticky="ew")
         self.model_combobox.bind("<<ComboboxSelected>>", self.on_model_changed)
+
+        self.add_model_button = tk.Button(controls_frame, text="Add", command=self.add_model, width=5)
+        self.add_model_button.grid(row=0, column=2, padx=(0, 5), pady=5, sticky="w")
+        self.remove_model_button = tk.Button(controls_frame, text="Remove", command=self.remove_model, width=8)
+        self.remove_model_button.grid(row=0, column=3, padx=(0, 0), pady=5, sticky="w")
+
+        # --- Row 1: Checkboxes ---
+        checkbox_frame = tk.Frame(controls_frame) # Frame to group checkboxes
+        checkbox_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 5))
 
         self.send_image_var = tk.BooleanVar(value=True)
         self.send_image_check = tk.Checkbutton(
-            controls_frame,
-            text="Send image with message",
-            justify=tk.LEFT,
-            variable=self.send_image_var
+            checkbox_frame, text="Send image", justify=tk.LEFT, variable=self.send_image_var
         )
-        self.send_image_check.pack(side=tk.LEFT, padx=10)
+        self.send_image_check.pack(side=tk.LEFT, padx=(0, 10))
 
         self.skip_tts_var = tk.BooleanVar(value=False)
         self.skip_tts_check = tk.Checkbutton(
-            controls_frame,
-            text="Skip TTS (Text response only)",
-            justify=tk.LEFT,
-            variable=self.skip_tts_var
+            checkbox_frame, text="Skip TTS", justify=tk.LEFT, variable=self.skip_tts_var
         )
-        self.skip_tts_check.pack(side=tk.LEFT, padx=10)
+        self.skip_tts_check.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.add_model_button = tk.Button(controls_frame, text="Add Model", command=self.add_model, width=10)
-        self.add_model_button.pack(side=tk.LEFT, padx=(5, 5))
-        self.remove_model_button = tk.Button(controls_frame, text="Remove Model", command=self.remove_model, width=12)
-        self.remove_model_button.pack(side=tk.LEFT, padx=(5, 0))
+        self.skip_dalle_var = tk.BooleanVar(value=False)
+        self.skip_dalle_check = tk.Checkbutton(
+            checkbox_frame, text="Skip DallE", justify=tk.LEFT, variable=self.skip_dalle_var
+        )
+        self.skip_dalle_check.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.skip_thinkoutloud_var = tk.BooleanVar(value=False)
+        self.skip_thinkoutloud_check = tk.Checkbutton(
+            checkbox_frame, text="Skip Thinking TTS", justify=tk.LEFT, variable=self.skip_thinkoutloud_var
+        )
+        self.skip_thinkoutloud_check.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.reset_conversation_var = tk.BooleanVar(value=False)
+        self.reset_conversation_check = tk.Checkbutton(
+            checkbox_frame, text="Reset Memory", justify=tk.LEFT, variable=self.reset_conversation_var
+        )
+        self.reset_conversation_check.pack(side=tk.LEFT, padx=(0, 10))
+
+        # --- Row 2: Action Buttons ---
+        action_button_frame = tk.Frame(controls_frame)
+        action_button_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 5))
 
         self.reset_conversation_button = tk.Button(
-            controls_frame,
-            text="Reset Memory",
-            command=self.reset_conversation,
-            width=15,
-            bg="#FF5733",
-            fg="white"
+            action_button_frame, text="Reset Memory", command=self.reset_conversation, width=12, bg="#FF5733", fg="white"
         )
-        self.reset_conversation_button.pack(side=tk.LEFT, padx=(10, 0))
+        self.reset_conversation_button.pack(side=tk.LEFT, padx=(0, 10))
 
         self.clear_chat_button = tk.Button(
-            controls_frame,
-            text="Clear chat",
-            command=self.clear_chat,
-            width=15,
-            bg="#3498DB",
-            fg="white"
+            action_button_frame, text="Clear chat", command=self.clear_chat, width=10, bg="#3498DB", fg="white"
         )
-        self.clear_chat_button.pack(side=tk.LEFT, padx=(10, 0))
+        self.clear_chat_button.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Game selection frame
+        # --- Row 3: Utility/App Buttons ---
+        utility_button_frame = tk.Frame(controls_frame)
+        utility_button_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=(0, 5))
+
+        self.thread_monitor_button = tk.Button(
+            utility_button_frame, text="Show Threads", command=self.show_active_threads, width=12, bg="#007BFF", fg="white"
+        )
+        self.thread_monitor_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.app2_button = tk.Button(
+            utility_button_frame, text="PDF Tool", command=self.launch_app2, width=8, bg="#4CAF50", fg="white"
+        )
+        self.app2_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.app3_button = tk.Button(
+            utility_button_frame, text="Keyboard TTS", command=self.launch_app3, width=12, bg="#4CAF50", fg="white"
+        )
+        self.app3_button.pack(side=tk.LEFT, padx=(0, 10))
+
+
+        # Game selection frame (remains packed below controls_frame)
         game_frame = tk.Frame(self.right_frame)
         game_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -863,7 +900,6 @@ class ChatAudioApp5(tk.Tk):
         self.create_chess_frame(self.right_frame)
         self.hide_chess_ui()  # Ensure it's hidden by default
 
-    # --------------------------- Create Settings Tab ---------------------------
     def create_settings_tab(self):
 
         self.settings_canvas = tk.Canvas(self.settings_tab, borderwidth=0, background="#f0f0f0")
@@ -883,37 +919,35 @@ class ChatAudioApp5(tk.Tk):
 
         # API Keys
         api_key_frame = tk.LabelFrame(self.settings_inner_frame, text="API Keys", padx=10, pady=10)
-        api_key_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        api_key_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+        api_key_frame.columnconfigure(1, weight=1) # Allow entry field to expand
 
         self.openai_key_label = tk.Label(api_key_frame, text="OpenAI API Key:")
-        self.openai_key_label.grid(row=0, column=0, sticky="w")
+        self.openai_key_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.openai_key_var = tk.StringVar()
         self.openai_key_entry = tk.Entry(api_key_frame, textvariable=self.openai_key_var, show="*", width=50)
-        self.openai_key_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.openai_key_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
         self.openrouter_key_label = tk.Label(api_key_frame, text="OpenRouter API Key:")
-        self.openrouter_key_label.grid(row=1, column=0, sticky="w")
+        self.openrouter_key_label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.openrouter_key_var = tk.StringVar()
         self.openrouter_key_entry = tk.Entry(api_key_frame, textvariable=self.openrouter_key_var, show="*", width=50)
-        self.openrouter_key_entry.grid(row=1, column=1, padx=5, pady=5)
-
-        self.save_keys_button = tk.Button(api_key_frame, text="Save API Keys", command=self.save_api_keys, width=20)
-        self.save_keys_button.grid(row=2, column=0, columnspan=2, pady=10)
+        self.openrouter_key_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
         # --- OpenRouter URL ---
         self.openrouter_url_label = tk.Label(api_key_frame, text="OpenRouter API URL:")
-        self.openrouter_url_label.grid(row=4, column=0, sticky="w")  # Row 4
+        self.openrouter_url_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
         self.openrouter_url_var = tk.StringVar()
         self.openrouter_url_entry = tk.Entry(api_key_frame, textvariable=self.openrouter_url_var, width=50)
-        self.openrouter_url_entry.grid(row=4, column=1, padx=5, pady=5)
+        self.openrouter_url_entry.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
 
-        # --- Button to Save ---
-        # (You already have the save_keys_button, we'll modify its command)
-        self.save_keys_button.grid(row=5, column=0, columnspan=2, pady=10)  # Adjust row if needed
+        self.save_keys_button = tk.Button(api_key_frame, text="Save API Keys & URL", command=self.save_api_keys, width=20)
+        self.save_keys_button.grid(row=3, column=0, columnspan=2, pady=(10, 5))
 
         # Language Selection
         language_frame = tk.LabelFrame(self.settings_inner_frame, text="Language Selection", padx=10, pady=10)
-        language_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        language_frame.pack(fill=tk.X, padx=10, pady=5)
+        language_frame.columnconfigure(1, weight=1)
 
         self.language_label = tk.Label(language_frame, text="Select Language:", anchor="w")
         self.language_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
@@ -922,38 +956,37 @@ class ChatAudioApp5(tk.Tk):
         self.language_combobox = ttk.Combobox(language_frame, textvariable=self.language_var, state="readonly", width=20)
         self.language_combobox['values'] = ("Finnish", "English", "Swedish", "Spanish")
         self.language_combobox.current(0)
-        self.language_combobox.grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        # After creating language_combobox in create_settings_tab method
+        self.language_combobox.grid(row=0, column=1, sticky="w", padx=5, pady=5) # Use sticky="w" to align left
         self.language_combobox.bind("<<ComboboxSelected>>", self.on_language_changed)
 
         # Default Image Path
         image_path_frame = tk.LabelFrame(self.settings_inner_frame, text="Default Image Path", padx=10, pady=10)
-        image_path_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        image_path_frame.pack(fill=tk.X, padx=10, pady=5)
+        image_path_frame.columnconfigure(0, weight=1) # Allow entry field to expand
 
         self.image_path_var = tk.StringVar()
         self.image_path_entry = tk.Entry(image_path_frame, textvariable=self.image_path_var, width=50)
-        self.image_path_entry.grid(row=0, column=0, padx=5, pady=5)
+        self.image_path_entry.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
 
-        # The line that references browse_image_path:
         self.browse_button = tk.Button(image_path_frame, text="Browse",
                                        command=self.browse_image_path, width=10)
         self.browse_button.grid(row=0, column=1, padx=5, pady=5)
 
-        # a Save Path button
         self.save_image_path_button = tk.Button(
             image_path_frame, text="Save Path", command=self.save_image_path, width=10
         )
-        self.save_image_path_button.grid(row=1, column=0, columnspan=2, pady=5)
+        self.save_image_path_button.grid(row=1, column=0, columnspan=2, pady=(5, 5))
 
         # Audio Parameters
         audio_params_frame = tk.LabelFrame(self.settings_inner_frame, text="Audio Parameters", padx=10, pady=10)
-        audio_params_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        audio_params_frame.pack(fill=tk.X, padx=10, pady=5)
+        # No columnconfigure needed if labels and entries are in separate columns
 
         self.vol_threshold_label = tk.Label(audio_params_frame, text="Volume Threshold:")
         self.vol_threshold_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.vol_threshold_var = tk.StringVar(value=str(config.get('VOL_THRESHOLD', DEFAULT_VOL_THRESHOLD)))
         self.vol_threshold_entry = tk.Entry(audio_params_frame, textvariable=self.vol_threshold_var, width=10)
-        self.vol_threshold_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.vol_threshold_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
         self.min_record_duration_label = tk.Label(audio_params_frame, text="Min Record Duration (s):")
         self.min_record_duration_label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
@@ -963,7 +996,7 @@ class ChatAudioApp5(tk.Tk):
         self.min_record_duration_entry = tk.Entry(
             audio_params_frame, textvariable=self.min_record_duration_var, width=10
         )
-        self.min_record_duration_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.min_record_duration_entry.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
         self.max_silence_duration_label = tk.Label(audio_params_frame, text="Max Silence Duration (s):")
         self.max_silence_duration_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
@@ -973,116 +1006,129 @@ class ChatAudioApp5(tk.Tk):
         self.max_silence_duration_entry = tk.Entry(
             audio_params_frame, textvariable=self.max_silence_duration_var, width=10
         )
-        self.max_silence_duration_entry.grid(row=2, column=1, padx=5, pady=5)
+        self.max_silence_duration_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
 
         self.save_audio_params_button = tk.Button(
             audio_params_frame, text="Save Parameters",
             command=self.save_audio_parameters, width=15
         )
-        self.save_audio_params_button.grid(row=3, column=0, columnspan=2, pady=10)
+        self.save_audio_params_button.grid(row=3, column=0, columnspan=2, pady=(10, 5))
 
         # Blacklist Management
         blacklist_frame = tk.LabelFrame(self.settings_inner_frame, text="Blacklist Management", padx=10, pady=10)
-        blacklist_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+        blacklist_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        blacklist_frame.columnconfigure(0, weight=1) # Allow listbox to expand horizontally
+        blacklist_frame.rowconfigure(0, weight=1) # Allow listbox to expand vertically
 
-        self.blacklist_listbox = tk.Listbox(blacklist_frame, selectmode=tk.SINGLE, width=50, height=10)
-        self.blacklist_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=5)
+        # Frame for listbox and scrollbar
+        listbox_frame = tk.Frame(blacklist_frame)
+        listbox_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=5)
+        listbox_frame.rowconfigure(0, weight=1)
+        listbox_frame.columnconfigure(0, weight=1)
+
+        self.blacklist_listbox = tk.Listbox(listbox_frame, selectmode=tk.SINGLE, width=50, height=6) # Reduced height
+        self.blacklist_listbox.grid(row=0, column=0, sticky="nsew")
 
         for phrase in self.excluded_phrases:
             self.blacklist_listbox.insert(tk.END, phrase)
 
-        self.blacklist_scrollbar = tk.Scrollbar(blacklist_frame, orient="vertical")
-        self.blacklist_scrollbar.config(command=self.blacklist_listbox.yview)
+        self.blacklist_scrollbar = tk.Scrollbar(listbox_frame, orient="vertical", command=self.blacklist_listbox.yview)
         self.blacklist_listbox.config(yscrollcommand=self.blacklist_scrollbar.set)
-        self.blacklist_scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        self.blacklist_scrollbar.grid(row=0, column=1, sticky="ns")
 
-        add_frame = tk.Frame(blacklist_frame)
-        add_frame.pack(fill=tk.X, padx=5, pady=5)
+        # Frame for add/remove controls on the right
+        controls_frame = tk.Frame(blacklist_frame)
+        controls_frame.grid(row=0, column=1, sticky="ns", padx=(5, 0), pady=5)
+
+        add_frame = tk.Frame(controls_frame)
+        add_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.new_phrase_var = tk.StringVar()
+        self.new_phrase_entry = tk.Entry(add_frame, textvariable=self.new_phrase_var, width=25) # Adjusted width
+        self.new_phrase_entry.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.add_phrase_button = tk.Button(add_frame, text="Add", command=self.add_blacklist_phrase, width=8) # Shortened text
+        self.add_phrase_button.pack(side=tk.LEFT)
+
+        self.remove_phrase_button = tk.Button(
+            controls_frame, text="Remove Selected",
+            command=self.remove_blacklist_phrase, width=15 # Adjusted width
+        )
+        self.remove_phrase_button.pack(pady=(5, 0))
 
 
+        # --------------------- LLM Personality ---------------------
+        llm_personality_frame = tk.LabelFrame(self.settings_inner_frame, text="LLM Personality", padx=10, pady=10)
+        llm_personality_frame.pack(fill=tk.X, padx=10, pady=5)
+        llm_personality_frame.columnconfigure(0, weight=1) # Allow text box to expand
 
-        # --------------------- LLM Persoonallisuus ---------------------
-        llm_personality_frame = tk.LabelFrame(self.settings_inner_frame, text="LLM Persoonallisuus", padx=10, pady=10)
-        llm_personality_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        # Name Frame
+        name_frame = tk.Frame(llm_personality_frame)
+        name_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=(0, 5))
+        tk.Label(name_frame, text="Name:").pack(side=tk.LEFT, padx=(0, 5))
+        self.personality_name_var = tk.StringVar()
+        self.personality_name_entry = tk.Entry(name_frame, textvariable=self.personality_name_var, width=30)
+        self.personality_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Tekstilaatikko persoonallisuutta varten
-        self.llm_personality_text = tk.Text(llm_personality_frame, height=5, width=50)
-        self.llm_personality_text.pack(padx=5, pady=5)
+        # Text Box
+        self.llm_personality_text = tk.Text(llm_personality_frame, height=4, width=50) # Reduced height
+        self.llm_personality_text.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 
-        # Lataa mahdollisesti aiemmin tallennettu persoonallisuusteksti
         default_personality = self.config_data.get('LLM_PERSONALITY',
                                                    'Give the LLM a hint or a full description about its desired personality. Then apply as is or click "Help me create persona" to get longer more detailed description."')
         self.llm_personality_text.insert("1.0", default_personality)
 
-        # Näppäin, jolla tallennetaan suoraan persoonallisuusteksti
-        save_personality_button = tk.Button(llm_personality_frame, text="Save personality",
-                                            command=self.save_llm_personality, width=20)
-        save_personality_button.pack(padx=5, pady=5)
+        # Buttons Frame
+        button_frame_llm = tk.Frame(llm_personality_frame)
+        button_frame_llm.grid(row=2, column=0, columnspan=2, pady=(5, 5))
 
-        # Uusi nappi: "Auta luomaan persoonallisuus:"
-        generate_personality_button = tk.Button(llm_personality_frame, text="Help me creating this persona:",
-                                                command=self.generate_personality_prompt, width=25)
-        generate_personality_button.pack(padx=5, pady=5)
+        save_personality_button = tk.Button(button_frame_llm, text="Save Personality",
+                                            command=self.save_llm_personality, width=15)
+        save_personality_button.pack(side=tk.LEFT, padx=5)
 
-        # Lisää tekstikenttä persoonallisuuden nimelle
-        name_frame = tk.Frame(llm_personality_frame)
-        name_frame.pack(padx=5, pady=(5, 0), fill=tk.X)
-        tk.Label(name_frame, text="Name of the personality:").pack(side=tk.LEFT, padx=(0, 5))
-        self.personality_name_var = tk.StringVar()
-        self.personality_name_entry = tk.Entry(name_frame, textvariable=self.personality_name_var, width=30)
-        self.personality_name_entry.pack(side=tk.LEFT)
+        generate_personality_button = tk.Button(button_frame_llm, text="Help Me Create Persona",
+                                                command=self.generate_personality_prompt, width=20)
+        generate_personality_button.pack(side=tk.LEFT, padx=5)
 
 
+        # --------------------- Saved LLM Personalities ---------------------
+        saved_personality_frame = tk.LabelFrame(self.settings_inner_frame, text="Saved Personalities", padx=10, pady=10)
+        saved_personality_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        saved_personality_frame.columnconfigure(0, weight=1) # Allow listbox to expand
+        saved_personality_frame.rowconfigure(0, weight=1) # Allow listbox to expand
 
-        # --------------------- Tallennetut LLM-persoonallisuudet ---------------------
-        saved_personality_frame = tk.LabelFrame(self.settings_inner_frame, text="Saved personalities",
-                                                padx=10, pady=10)
-        saved_personality_frame.pack(fill=tk.BOTH, padx=10, pady=(10, 0))
+        # Frame for listbox and scrollbar
+        saved_listbox_frame = tk.Frame(saved_personality_frame)
+        saved_listbox_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=5)
+        saved_listbox_frame.rowconfigure(0, weight=1)
+        saved_listbox_frame.columnconfigure(0, weight=1)
 
-        # Listbox, joka näyttää tallennetut persoonallisuudet
-        self.saved_personalities_listbox = tk.Listbox(saved_personality_frame, height=5, width=40)
-        self.saved_personalities_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5), pady=5)
+        self.saved_personalities_listbox = tk.Listbox(saved_listbox_frame, height=4, width=40) # Reduced height
+        self.saved_personalities_listbox.grid(row=0, column=0, sticky="nsew")
 
-        # Scrollbar listboxille
-        saved_personality_scrollbar = tk.Scrollbar(saved_personality_frame, orient="vertical",
+        saved_personality_scrollbar = tk.Scrollbar(saved_listbox_frame, orient="vertical",
                                                    command=self.saved_personalities_listbox.yview)
-        saved_personality_scrollbar.pack(side=tk.LEFT, fill=tk.Y)
         self.saved_personalities_listbox.config(yscrollcommand=saved_personality_scrollbar.set)
+        saved_personality_scrollbar.grid(row=0, column=1, sticky="ns")
 
-        # Nappi, jolla valittu persoonallisuus ladataan tekstilaatikkoon
-        load_personality_button = tk.Button(saved_personality_frame, text="Edit/Apply selected",
-                                            command=self.load_selected_personality, width=20)
-        load_personality_button.pack(side=tk.TOP, padx=5, pady=5)
+        # Frame for buttons on the right
+        saved_buttons_frame = tk.Frame(saved_personality_frame)
+        saved_buttons_frame.grid(row=0, column=1, sticky="n", padx=(5, 0), pady=5)
 
-        # Nappi tallentamaan ja poistamaan tallennettuja persoonallisuuksia (tarvittaessa)
-        delete_personality_button = tk.Button(saved_personality_frame, text="Delete selected",
-                                              command=self.delete_selected_personality, width=20)
-        delete_personality_button.pack(side=tk.TOP, padx=5, pady=5)
+        load_personality_button = tk.Button(saved_buttons_frame, text="Edit/Apply Selected",
+                                            command=self.load_selected_personality, width=18) # Adjusted width
+        load_personality_button.pack(side=tk.TOP, pady=(0, 5))
 
+        delete_personality_button = tk.Button(saved_buttons_frame, text="Delete Selected",
+                                              command=self.delete_selected_personality, width=18) # Adjusted width
+        delete_personality_button.pack(side=tk.TOP, pady=5)
 
-
-        self.new_phrase_var = tk.StringVar()
-        self.new_phrase_entry = tk.Entry(add_frame, textvariable=self.new_phrase_var, width=40)
-        self.new_phrase_entry.pack(side=tk.LEFT, padx=(0, 5), pady=5)
-
-        self.add_phrase_button = tk.Button(add_frame, text="Add Phrase", command=self.add_blacklist_phrase)
-        self.add_phrase_button.pack(side=tk.LEFT, padx=(0, 5), pady=5)
-
-        self.remove_phrase_button = tk.Button(
-            blacklist_frame, text="Remove Selected",
-            command=self.remove_blacklist_phrase
-        )
-        self.remove_phrase_button.pack(pady=(0, 5))
-
-        
-
-        # In the create_settings_tab method, add after another frame (e.g., after reasoning_frame)
 
         # --------------------- TTS Voice Selection ---------------------
-        tts_voice_frame = tk.LabelFrame(self.settings_inner_frame, text="Text-to-Speech Voice", padx=10, pady=10)
-        tts_voice_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        tts_voice_frame = tk.LabelFrame(self.settings_inner_frame, text="Text-to-Speech Voice (OpenAI)", padx=10, pady=10)
+        tts_voice_frame.pack(fill=tk.X, padx=10, pady=5)
+        tts_voice_frame.columnconfigure(1, weight=1)
 
-        # Voice selection dropdown
         voice_label = tk.Label(tts_voice_frame, text="Select Voice:")
         voice_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
 
@@ -1096,17 +1142,9 @@ class ChatAudioApp5(tk.Tk):
         )
         self.tts_voice_combobox.grid(row=0, column=1, sticky="w", padx=5, pady=5)
 
-        # Voice descriptions
         voice_descriptions = (
-            "alloy: Versatile, neutral\n"
-            "echo: Deep, resonant\n"
-            "fable: British, warmth\n"
-            "onyx: Deep, authoritative\n"
-            "nova: Warm, natural female\n"
-            "shimmer: Clear, optimistic\n"
-            "ash: Clear explanation style\n"
-            "coral: Warm, female style\n"
-            "sage: Gentle, thoughtful"
+            "alloy: Versatile | echo: Deep | fable: British | onyx: Authoritative\n" # Condensed
+            "nova: Warm Female | shimmer: Optimistic | ash: Explainer | coral: Warm Female | sage: Thoughtful"
         )
         voice_help = tk.Label(
             tts_voice_frame,
@@ -1117,58 +1155,174 @@ class ChatAudioApp5(tk.Tk):
         )
         voice_help.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
-        # Save button
         self.save_tts_voice_button = tk.Button(
             tts_voice_frame,
             text="Save TTS Settings",
             command=self.save_tts_settings,
             width=20
         )
-        self.save_tts_voice_button.grid(row=2, column=0, columnspan=2, pady=10)
+        self.save_tts_voice_button.grid(row=2, column=0, columnspan=2, pady=(10, 5))
 
-        # Load saved voice setting if available
         if 'TTS_VOICE' in self.config_data:
             self.tts_voice_var.set(self.config_data['TTS_VOICE'])
 
-        # Load existing API keys/parameters
-        self.load_existing_api_keys()
+        # --------------------- Local TTS Settings ---------------------
+        local_tts_frame = tk.LabelFrame(self.settings_inner_frame, text="Local Text-to-Speech (gTTS)", padx=10, pady=10)
+        local_tts_frame.pack(fill=tk.X, padx=10, pady=5)
+        local_tts_frame.columnconfigure(1, weight=1)
+
+        self.use_local_tts_var = tk.BooleanVar(value=self.config_data.get('USE_LOCAL_TTS', False))
+        self.use_local_tts_check = tk.Checkbutton(
+            local_tts_frame,
+            text="Use local TTS (instead of OpenAI API)",
+            variable=self.use_local_tts_var,
+            command=self.toggle_local_tts_settings
+        )
+        self.use_local_tts_check.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        self.gtts_lang_label = tk.Label(local_tts_frame, text="TTS Language:")
+        self.gtts_lang_label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
+
+        self.gtts_lang_var = tk.StringVar(value=self.config_data.get('GTTS_LANGUAGE', 'en'))
+        self.gtts_lang_combobox = ttk.Combobox(
+            local_tts_frame,
+            textvariable=self.gtts_lang_var,
+            state="readonly" if self.use_local_tts_var.get() else "disabled",
+            width=20,
+            values=["en", "fi", "sv", "es", "fr", "de", "it", "ja", "ko", "zh-CN", "ru"]
+        )
+        self.gtts_lang_combobox.grid(row=1, column=1, sticky="w", padx=5, pady=5)
+
+        gtts_status = "Available" if GTTS_AVAILABLE else "Not installed - run 'pip install gtts playsound==1.2.2'"
+        self.gtts_status_label = tk.Label(
+            local_tts_frame,
+            text=f"gTTS Status: {gtts_status}",
+            fg="green" if GTTS_AVAILABLE else "red"
+        )
+        self.gtts_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        lang_desc = ( # Condensed
+            "en: English | fi: Finnish | sv: Swedish | es: Spanish | fr: French\n"
+            "de: German | it: Italian | ja: Japanese | ko: Korean | zh-CN: Chinese | ru: Russian"
+        )
+        desc_label = tk.Label(
+            local_tts_frame,
+            text=lang_desc,
+            font=("TkDefaultFont", 8),
+            fg="gray",
+            justify="left"
+        )
+        desc_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        self.save_local_tts_button = tk.Button(
+            local_tts_frame,
+            text="Save Local TTS Settings",
+            command=self.save_local_tts_settings,
+            width=20
+        )
+        self.save_local_tts_button.grid(row=4, column=0, columnspan=2, pady=(10, 5))
 
         # --------------------- Mureka API Settings ---------------------
-        mureka_frame = tk.LabelFrame(self.settings_inner_frame, text="Mureka API Settings", padx=10, pady=10)
-        mureka_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        mureka_frame = tk.LabelFrame(self.settings_inner_frame, text="Mureka API Settings (Music Generation)", padx=10, pady=10)
+        mureka_frame.pack(fill=tk.X, padx=10, pady=5)
+        mureka_frame.columnconfigure(1, weight=1)
 
-        # API URL
         self.mureka_url_label = tk.Label(mureka_frame, text="Mureka API URL:")
-        self.mureka_url_label.grid(row=0, column=0, sticky="w")
+        self.mureka_url_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.mureka_url_var = tk.StringVar()
         self.mureka_url_entry = tk.Entry(mureka_frame, textvariable=self.mureka_url_var, width=50)
-        self.mureka_url_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.mureka_url_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
-        # Account
         self.mureka_account_label = tk.Label(mureka_frame, text="Mureka Account:")
-        self.mureka_account_label.grid(row=1, column=0, sticky="w")
+        self.mureka_account_label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.mureka_account_var = tk.StringVar()
         self.mureka_account_entry = tk.Entry(mureka_frame, textvariable=self.mureka_account_var, width=50)
-        self.mureka_account_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.mureka_account_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
-        # API Token
         self.mureka_token_label = tk.Label(mureka_frame, text="Mureka API Token:")
-        self.mureka_token_label.grid(row=2, column=0, sticky="w")
-        self.mureka_token_var = tk.StringVar()  # Hide the token
+        self.mureka_token_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self.mureka_token_var = tk.StringVar()
         self.mureka_token_entry = tk.Entry(mureka_frame, textvariable=self.mureka_token_var, width=50, show="*")
-        self.mureka_token_entry.grid(row=2, column=1, padx=5, pady=5)
+        self.mureka_token_entry.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
 
-        # Save Mureka Keys Button
         self.save_mureka_keys_button = tk.Button(mureka_frame, text="Save Mureka Keys", command=self.save_mureka_keys,
                                                  width=20)
-        self.save_mureka_keys_button.grid(row=3, column=0, columnspan=2, pady=10)
+        self.save_mureka_keys_button.grid(row=3, column=0, columnspan=2, pady=(10, 5))
 
-        # --------------------- Added Audio Source 1 and 2 Selection ---------------------
-        # Audio Source 1 Selection
-        audio_source1_frame = tk.LabelFrame(self.settings_inner_frame, text="Microphone (Input) IMPORTANT: SAME AS WINDOWS MICROPHONE", padx=10, pady=10)
-        audio_source1_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        # --------------------- Whisper Configuration ---------------------
+        whisper_frame = tk.LabelFrame(self.settings_inner_frame, text="Speech Recognition Settings", padx=10, pady=10)
+        whisper_frame.pack(fill=tk.X, padx=10, pady=5)
+        whisper_frame.columnconfigure(1, weight=1)
 
-        audio_source1_label = tk.Label(audio_source1_frame, text="Select Input Device:")
+        self.use_local_whisper_var = tk.BooleanVar(value=self.config_data.get('USE_LOCAL_WHISPER', False))
+        self.use_local_whisper_check = tk.Checkbutton(
+            whisper_frame,
+            text="Use local Whisper model (instead of OpenAI API)",
+            variable=self.use_local_whisper_var,
+            command=self.toggle_whisper_settings
+        )
+        self.use_local_whisper_check.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        self.whisper_model_label = tk.Label(whisper_frame, text="Local Whisper Model:")
+        self.whisper_model_label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
+
+        self.whisper_model_var = tk.StringVar(value=self.config_data.get('WHISPER_MODEL', 'base'))
+        self.whisper_model_combobox = ttk.Combobox(
+            whisper_frame,
+            textvariable=self.whisper_model_var,
+            state="readonly",
+            width=20,
+            values=["tiny", "base", "small", "medium", "large"]
+        )
+        self.whisper_model_combobox.grid(row=1, column=1, sticky="w", padx=5, pady=5)
+
+        self.whisper_status_label = tk.Label(
+            whisper_frame,
+            text="Status: Not loaded",
+            fg="blue"
+        )
+        self.whisper_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        model_desc = ( # Condensed
+            "tiny: Fastest (1GB) | base: Fast (1GB) | small: Balanced (2GB)\n"
+            "medium: Good (5GB) | large: Best, slowest (10GB) | Requires RAM"
+        )
+        desc_label = tk.Label(
+            whisper_frame,
+            text=model_desc,
+            font=("TkDefaultFont", 8),
+            fg="gray",
+            justify="left"
+        )
+        desc_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        usage_label = tk.Label(
+            whisper_frame,
+            text="Note: Local Whisper requires 'pip install openai-whisper'",
+            font=("TkDefaultFont", 8, "italic"),
+            fg="blue",
+            justify="left"
+        )
+        usage_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=5) # Moved usage below desc
+
+        self.save_whisper_button = tk.Button(
+            whisper_frame,
+            text="Save & Load Whisper Settings",
+            command=self.save_whisper_settings,
+            width=25
+        )
+        self.save_whisper_button.grid(row=5, column=0, columnspan=2, pady=(10, 5)) # Moved save button down
+
+        self.whisper_model = None
+        self.toggle_whisper_settings()
+
+        # --------------------- Audio Source Selection ---------------------
+        # Microphone Input
+        audio_source1_frame = tk.LabelFrame(self.settings_inner_frame, text="Microphone Input", padx=10, pady=10)
+        audio_source1_frame.pack(fill=tk.X, padx=10, pady=5)
+        audio_source1_frame.columnconfigure(1, weight=1)
+
+        audio_source1_label = tk.Label(audio_source1_frame, text="Select Device:")
         audio_source1_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
 
         self.available_input_devices1 = self.get_input_audio_devices_for_combobox()
@@ -1180,18 +1334,19 @@ class ChatAudioApp5(tk.Tk):
             width=50,
             values=[item[0] for item in self.available_input_devices1]
         )
-        self.audio_source1_combobox.grid(row=0, column=1, padx=5, pady=5)
+        self.audio_source1_combobox.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         if self.available_input_devices1:
             self.audio_source1_combobox.current(0)
 
-        # Audio Source 2 Selection
-        audio_source2_frame = tk.LabelFrame(self.settings_inner_frame, text="System audio (Input) IMPORTANT: 1. SET this and WINDOWS PLAYBACK DEVICE IN SETTINGS TO BE FOR EXAMPLE ...steam streaming speakers... IF YOU WANT THE LLM TO HEAR SYSTEM AUDIO. 2. If does not work: IN WINDOWS AUDIO SETTINGS SET SAMPLE RATE 16-bit 44100Hz. ", padx=10, pady=10)
-        audio_source2_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        # System Audio Input
+        audio_source2_frame = tk.LabelFrame(self.settings_inner_frame, text="System Audio Input (Loopback)", padx=10, pady=10)
+        audio_source2_frame.pack(fill=tk.X, padx=10, pady=5)
+        audio_source2_frame.columnconfigure(1, weight=1)
 
-        audio_source2_label = tk.Label(audio_source2_frame, text="Select Input Device:")
+        audio_source2_label = tk.Label(audio_source2_frame, text="Select Device:")
         audio_source2_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
 
-        self.available_input_devices2 = self.get_input_audio_devices_for_combobox()
+        self.available_input_devices2 = self.get_input_audio_devices_for_combobox() # Assuming same list is fine
         self.audio_source2_var = tk.StringVar()
         self.audio_source2_combobox = ttk.Combobox(
             audio_source2_frame,
@@ -1200,15 +1355,16 @@ class ChatAudioApp5(tk.Tk):
             width=50,
             values=[item[0] for item in self.available_input_devices2]
         )
-        self.audio_source2_combobox.grid(row=0, column=1, padx=5, pady=5)
+        self.audio_source2_combobox.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         if self.available_input_devices2:
             self.audio_source2_combobox.current(0)
 
-        # Audio Output Selection
-        audio_output_frame = tk.LabelFrame(self.settings_inner_frame, text="Audio Output (Playback) IMPORTANT: CHOOSE A DEVICE THAT CAN PLAY AUDIO OUT LOUD AND IS CONNECTED TO THE COMPUTER", padx=10, pady=10)
-        audio_output_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        # Audio Output
+        audio_output_frame = tk.LabelFrame(self.settings_inner_frame, text="Audio Output (Playback)", padx=10, pady=10)
+        audio_output_frame.pack(fill=tk.X, padx=10, pady=5)
+        audio_output_frame.columnconfigure(1, weight=1)
 
-        audio_output_label = tk.Label(audio_output_frame, text="Select Output Device:")
+        audio_output_label = tk.Label(audio_output_frame, text="Select Device:")
         audio_output_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
 
         self.available_output_devices = self.get_output_audio_devices_for_combobox()
@@ -1220,21 +1376,26 @@ class ChatAudioApp5(tk.Tk):
             width=50,
             values=[item[0] for item in self.available_output_devices]
         )
-        self.audio_output_combobox.grid(row=0, column=1, padx=5, pady=5)
+        self.audio_output_combobox.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         if self.available_output_devices:
             self.audio_output_combobox.current(0)
 
+        # Add a save button for audio devices
+        save_audio_devices_button = tk.Button(
+            audio_output_frame, # Place in last audio frame
+            text="Save Audio Devices",
+            command=self.save_api_keys, # Re-use save_api_keys as it saves devices too
+            width=20
+        )
+        save_audio_devices_button.grid(row=1, column=0, columnspan=2, pady=(10, 5))
 
-
-
-        self.load_mureka_settings()  # Ladataan Mureka asetukset
+        self.load_mureka_settings()
 
         # --------------------- AI Reasoning Controls ---------------------
-        # Add this section before or after one of your existing sections (e.g., after Mureka API Settings)
         reasoning_frame = tk.LabelFrame(self.settings_inner_frame, text="AI Reasoning Controls", padx=10, pady=10)
-        reasoning_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        reasoning_frame.pack(fill=tk.X, padx=10, pady=5)
+        reasoning_frame.columnconfigure(1, weight=1)
 
-        # Reasoning effort selection
         reasoning_effort_label = tk.Label(reasoning_frame, text="Reasoning Effort:")
         reasoning_effort_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
 
@@ -1248,7 +1409,6 @@ class ChatAudioApp5(tk.Tk):
         )
         self.reasoning_effort_combobox.grid(row=0, column=1, sticky="w", padx=5, pady=5)
 
-        # Show reasoning checkbox
         self.show_reasoning_var = tk.BooleanVar(value=True)
         self.show_reasoning_check = ttk.Checkbutton(
             reasoning_frame,
@@ -1257,25 +1417,7 @@ class ChatAudioApp5(tk.Tk):
         )
         self.show_reasoning_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
-        # Add a save button to the reasoning frame
-        self.save_reasoning_button = tk.Button(
-            reasoning_frame,
-            text="Save Reasoning Settings",
-            command=self.save_reasoning_settings,
-            width=20
-        )
-        self.save_reasoning_button.grid(row=3, column=0, columnspan=2, pady=10)
-
-        # Load reasoning settings
-        if 'REASONING_EFFORT' in self.config_data:
-            self.reasoning_effort_var.set(self.config_data['REASONING_EFFORT'])
-        if 'SHOW_REASONING' in self.config_data:
-            self.show_reasoning_var.set(self.config_data['SHOW_REASONING'])
-
-        # Help text
-        help_text = ("Low effort: Basic reasoning\n"
-                    "Medium effort: Balanced reasoning\n"
-                    "High effort: Detailed, multi-step reasoning")
+        help_text = ("Low: Basic | Medium: Balanced | High: Detailed") # Condensed
         help_label = tk.Label(
             reasoning_frame,
             text=help_text,
@@ -1284,205 +1426,568 @@ class ChatAudioApp5(tk.Tk):
         )
         help_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
-    # Add this method to your ChatAudioApp5 class
-
-
-    def on_audio_source_change(self, *args):
-        """Update last_audio_source when audio source changes, excluding mute."""
-        current = self.audio_source_toggle_var.get()
-        if current != "mute":
-            self.last_audio_source = current    
-
-    def on_language_changed(self, event):
-        """Handle language selection changes and restart listening if active"""
-        new_language = self.language_var.get()
-        self.append_message(f"Language changed to: {new_language}", sender="system")
-        
-        # Restart the listening process with the new language
-        if hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.is_alive():
-            # Stop current listening process
-            self.stop_listening()
-            # Small delay to ensure cleanup completes
-            self.after(500, self.start_listening)
-        else:
-            # If not already running, just update the status
-            self.append_message("Language will be used for the next conversation", sender="system")
-
-    def on_model_changed(self, event):
-        """Handle model selection changes and restart listening if active"""
-        new_model = self.model_var.get()
-        self.append_message(f"Model changed to: {new_model}", sender="system")
-
-        # Restart the listening process with the new model
-        if hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.is_alive():
-            # Stop current listening process
-            self.stop_listening()
-            # Small delay to ensure cleanup completes
-            self.after(500, self.start_listening)
-        else:
-            # If not already running, just update the status
-            self.append_message("Model will be used for the next conversation", sender="system")        
-
-
-    def save_tts_settings(self):
-        """Save TTS voice settings to config file"""
-        voice = self.tts_voice_var.get()
-        self.config_data['TTS_VOICE'] = voice
-        
-        # Save to config file
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.config_data, f, indent=4)
-        
-        messagebox.showinfo("Settings Saved", "TTS voice settings saved successfully.")
-
-    def save_reasoning_settings(self):
-        self.config_data['REASONING_EFFORT'] = self.reasoning_effort_var.get()
-        self.config_data['SHOW_REASONING'] = self.show_reasoning_var.get()
-        
-        # Save to config file
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.config_data, f, indent=4)
-        
-        messagebox.showinfo("Settings Saved", "Reasoning settings saved successfully.")
-
-    # Lisätään metodi Mureka-asetusten tallentamiseen:
-    def save_mureka_keys(self):
-        mureka_url = self.mureka_url_var.get().strip()
-        mureka_account = self.mureka_account_var.get().strip()
-        mureka_token = self.mureka_token_var.get().strip()
-
-        if not mureka_url or not mureka_account or not mureka_token:
-            messagebox.showerror("Error", "All Mureka API fields must be filled.")
-            return
-
-        if not messagebox.askyesno("Confirm", "Are you sure you want to save the provided Mureka API keys?"):
-            return
-
-        self.config_data['MUREKA_API_URL'] = mureka_url
-        self.config_data['MUREKA_ACCOUNT'] = mureka_account
-        self.config_data['MUREKA_API_TOKEN'] = mureka_token
-
-        save_config(self.config_data)
-        messagebox.showinfo("Success", "Mureka API keys saved successfully.")
-
-        self.mureka_token_var.set("******")  # Don't display the actual token
-        self.append_message("Mureka API keys loaded successfully.", sender="system")
-
-    # Lisätään metodi Mureka-asetusten lataamiseen:
-    def load_mureka_settings(self):
-        mureka_url = self.config_data.get('MUREKA_API_URL', '')
-        mureka_account = self.config_data.get('MUREKA_ACCOUNT', '')
-        mureka_token = self.config_data.get('MUREKA_API_TOKEN', '')
-
-        self.mureka_url_var.set(mureka_url)
-        self.mureka_account_var.set(mureka_account)
-        if mureka_token:
-            self.mureka_token_entry.insert(0, "******") # Oikein. Lisätään Entry-widgettiin
-            self.mureka_token_entry.config(show="*")  # Varmistetaan, että Entry näyttää tähdet
-
-        
-
-
-    def browse_image_path(self):
-        """Let the user pick a default image directory."""
-        selected_path = filedialog.askdirectory(
-            initialdir=self.image_path_var.get() or DEFAULT_IMAGE_DIR,
-            title="Select Default Image Directory"
+        self.save_reasoning_button = tk.Button(
+            reasoning_frame,
+            text="Save Reasoning Settings",
+            command=self.save_reasoning_settings,
+            width=20
         )
-        if selected_path:
-            self.image_path_var.set(selected_path)
+        self.save_reasoning_button.grid(row=3, column=0, columnspan=2, pady=(10, 5))
 
-    def launch_app2(self):
-        """Launch App2 (PDF extractor) as a separate process with correct paths"""
-        try:
-            # Get the directory of the current script (main app)
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            app2_path = os.path.join(script_dir, "SimplerPDFextract.py")
+        # Load reasoning settings
+        if 'REASONING_EFFORT' in self.config_data:
+            self.reasoning_effort_var.set(self.config_data['REASONING_EFFORT'])
+        if 'SHOW_REASONING' in self.config_data:
+            self.show_reasoning_var.set(self.config_data['SHOW_REASONING'])
+
+        # Load existing API keys/parameters (moved to end to ensure widgets exist)
+        self.load_existing_api_keys()
+
+    def create_chess_frame(self, parent):
+        """Build the frame holding the chess canvas and controls."""
+        self.chess_frame = tk.Frame(parent)
+
+        # Chess board canvas frame
+        self.chess_canvas_frame = tk.Frame(self.chess_frame)
+        self.chess_canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=10, pady=5)
+
+        self.chess_canvas = tk.Canvas(
+            self.chess_canvas_frame,
+            width=self.square_size * 8,
+            height=self.square_size * 8
+        )
+        self.chess_canvas.pack()
+        self.chess_canvas.bind("<Button-1>", self.on_chess_canvas_click)
+
+        # Controls panel below the chess board
+        controls_frame = tk.Frame(self.chess_frame)
+        controls_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+
+        # Left column: buttons
+        left_controls = tk.Frame(controls_frame)
+        left_controls.grid(row=0, column=0, sticky="w", padx=(0, 20))
+
+        self.ai_move_button = tk.Button(
+            left_controls,
+            text="Ask AI for a Move",
+            command=self.retry_ai_move,
+            width=15,
+            state=tk.NORMAL,
+        )
+        self.ai_move_button.pack(side=tk.TOP, pady=5)
+
+        self.reset_game_button = tk.Button(
+            left_controls,
+            text="Reset game",
+            command=self.reset_chess_game,
+            width=15,
+            bg="#FF5733",
+            fg="white"
+        )
+        self.reset_game_button.pack(side=tk.TOP, pady=5)
+
+        # Right column: checkboxes
+        right_controls = tk.Frame(controls_frame)
+        right_controls.grid(row=0, column=1, sticky="e")
+
+        self.ai_only_valid_moves_check = tk.Checkbutton(
+            right_controls,
+            text=("Include a list of legal moves\nwith your move\n"
+                "this will be sent to the AI\nDisable this for more interesting gameplay."),
+            justify=tk.LEFT,
+            variable=self.show_ai_only_valid_moves_var,
+            command=self.update_ai_only_valid_moves
+        )
+        self.ai_only_valid_moves_check.pack(side=tk.TOP, pady=5)
+
+        self.include_explanation_var = tk.BooleanVar(value=True)
+        self.include_explanation_check = tk.Checkbutton(
+            right_controls,
+            text=("Ask AI to include verbal explanation\nfor the move and speak the explanation out loud"),
+            justify=tk.LEFT,
+            variable=self.include_explanation_var
+        )
+        self.include_explanation_check.pack(side=tk.TOP, pady=5)
+
+    def create_tasks_tab(self):
+        """Create or update the tasks tab with enhanced features"""
+        # Clear any existing content in the tasks tab
+        for widget in self.tasks_tab.winfo_children():
+            widget.destroy()
             
-            # Launch using current Python executable and absolute path
-            subprocess.Popen([sys.executable, app2_path])
-            self.append_message("Launched PDF Extractor", sender="system")
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not start App2: {e}")
+        # Create main frame for tasks
+        tasks_frame = tk.Frame(self.tasks_tab)
+        tasks_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Task filter options
+        filter_frame = tk.Frame(tasks_frame)
+        filter_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.task_filter_var = tk.StringVar(value="all")
+        tk.Label(filter_frame, text="Show tasks:").pack(side=tk.LEFT, padx=(0, 10))
+        
+        tk.Radiobutton(filter_frame, text="All", variable=self.task_filter_var, 
+                    value="all", command=self.refresh_tasks_list).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(filter_frame, text="Active", variable=self.task_filter_var,
+                    value="active", command=self.refresh_tasks_list).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(filter_frame, text="Completed", variable=self.task_filter_var,
+                    value="completed", command=self.refresh_tasks_list).pack(side=tk.LEFT, padx=5)
+        
+        # Tasks list with scrollbar
+        list_frame = tk.Frame(tasks_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.tasks_listbox = tk.Listbox(list_frame, selectmode=tk.SINGLE, font=("Arial", 11), height=15)
+        self.tasks_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tasks_listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tasks_listbox.config(yscrollcommand=scrollbar.set)
+        
+        # Action buttons
+        buttons_frame = tk.Frame(tasks_frame)
+        buttons_frame.pack(fill=tk.X, pady=10)
+        
+        # Add task button
+        add_button = tk.Button(buttons_frame, text="Add Task", 
+                            command=self.show_add_task_dialog, width=15)
+        add_button.pack(side=tk.LEFT, padx=5)
+        
+        # Toggle completion button
+        toggle_button = tk.Button(buttons_frame, text="Toggle Completion", 
+                                command=self.toggle_selected_task, width=15)
+        toggle_button.pack(side=tk.LEFT, padx=5)
+        
+        # Delete task button
+        delete_button = tk.Button(buttons_frame, text="Delete Task", 
+                                command=self.delete_selected_task, bg="#FF5733", fg="white", width=15)
+        delete_button.pack(side=tk.LEFT, padx=5)
 
-    def launch_app3(self):
-        """Launch App3 (Keyboard TTS) with proper paths"""
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            app3_path = os.path.join(script_dir, "keyboardtts.py")
-            subprocess.Popen([sys.executable, app3_path])
-            self.append_message("Launched Keyboard TTS", sender="system")
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not start keyboard TTS: {e}")
+        # Schedule controls
+        schedule_frame = tk.LabelFrame(self.tasks_tab, text="Work/Break Schedule", padx=10, pady=10)
+        schedule_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Label(schedule_frame, text="Work duration (minutes):").grid(row=0, column=0, sticky="w")
+        self.work_entry = tk.Entry(schedule_frame, width=10)
+        self.work_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        tk.Label(schedule_frame, text="Break duration (minutes):").grid(row=1, column=0, sticky="w")
+        self.break_entry = tk.Entry(schedule_frame, width=10)
+        self.break_entry.grid(row=1, column=1, padx=5, pady=5)
+        
+        self.start_button = tk.Button(schedule_frame, text="Start Schedule", command=self.start_schedule, width=15)
+        self.start_button.grid(row=2, column=0, pady=5)
+        
+        self.stop_button = tk.Button(schedule_frame, text="Stop Schedule", command=self.stop_schedule, width=15, state=tk.DISABLED)
+        self.stop_button.grid(row=2, column=1, pady=5)
+        
+        self.schedule_status_label = tk.Label(schedule_frame, text="Schedule not running", font=("Arial", 10))
+        self.schedule_status_label.grid(row=3, column=0, columnspan=2, pady=5)
+        
+        self.work_entry.insert(0, str(self.config_data.get('WORK_DURATION', 25)))
+        self.break_entry.insert(0, str(self.config_data.get('BREAK_DURATION', 5)))
+        self.refresh_tasks_list()        
+        
+        # Initial load of tasks
+        self.refresh_tasks_list()
 
-            
-
-    def map_language_to_code(self, lang_name):
-        lookup = {
-            "Finnish": "fi",
-            "Swedish": "sv",
-            "Spanish": "es",
-            "English": "en"
-        }
-        return lookup.get(lang_name, "en")
-
-    def get_input_audio_devices_for_combobox(self):
-        devices = []
-        try:
-            all_devices = sd.query_devices()
-            default_host_api = sd.query_hostapis(sd.default.hostapi)
-            host_api_name = default_host_api['name'].lower()
-
-            for idx, dev in enumerate(all_devices):
-                if dev['max_input_channels'] > 0:
-                    is_loopback = False
-                    if 'windows wasapi' in host_api_name:
-                        if 'loopback' in dev['name'].lower():
-                            is_loopback = True
-                    label = f"{dev['name']} (Chans: {dev['max_input_channels']})"
-                    devices.append((label, idx, is_loopback))
-        except Exception as e:
-            messagebox.showerror("Error Listing Devices", f"Could not list input audio devices:\n{e}")
-
-        if not devices:
-            devices.append(("No valid input devices found", None, False))
-
-        return devices
-
-    def get_output_audio_devices_for_combobox(self):
-        devices = []
-        try:
-            all_devices = sd.query_devices()
-            for idx, dev in enumerate(all_devices):
-                if dev['max_output_channels'] > 0:
-                    label = f"{dev['name']} (Output Chans: {dev['max_output_channels']})"
-                    devices.append((label, idx))
-        except Exception as e:
-            messagebox.showerror("Error Listing Devices", f"Could not list output audio devices:\n{e}")
-
-        if not devices:
-            devices.append(("No valid output devices found", None))
-
-        return devices  
-
-
-    def toggle_listening_state(self):
-        """Toggle between listening and paused states, stopping/starting streams."""
-        current_state = self.audio_source_toggle_var.get()
-        if current_state == "mute":
-            # Resuming listening
-            self.audio_source_toggle_var.set(self.last_audio_source)
-            self.start_listening()
-            self.listening_status_label.config(text="Listening Status: Active", fg="green")
+    def bind_mousewheel(self):
+        system = platform.system()
+        if system == 'Windows':
+            self.bind_all("<MouseWheel>", self.on_mousewheel_windows)
+        elif system == 'Darwin':
+            self.bind_all("<MouseWheel>", self.on_mousewheel_mac)
         else:
-            # Pausing listening
-            self.last_audio_source = current_state
-            self.stop_listening()
-            self.audio_source_toggle_var.set("mute")
-            self.listening_status_label.config(text="Listening Status: Paused", fg="red")
+            self.bind_all("<Button-4>", self.on_mousewheel_linux)
+            self.bind_all("<Button-5>", self.on_mousewheel_linux)
+
+    def add_reasoning_controls(self, settings_frame):
+        """Add reasoning controls to the settings frame"""
+        reasoning_frame = ttk.LabelFrame(settings_frame, text="AI Reasoning")
+        reasoning_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Reasoning effort selection
+        ttk.Label(reasoning_frame, text="Reasoning Effort:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.reasoning_effort_var = tk.StringVar(value="medium")
+        reasoning_combo = ttk.Combobox(reasoning_frame, textvariable=self.reasoning_effort_var, 
+                                    values=["low", "medium", "high"])
+        reasoning_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        
+        # Show reasoning checkbox
+        self.show_reasoning_var = tk.BooleanVar(value=True)
+        show_reasoning_check = ttk.Checkbutton(reasoning_frame, text="Show AI reasoning process", 
+                                            variable=self.show_reasoning_var)
+        show_reasoning_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+        
+        # Help text
+        help_text = ("Low effort: Basic reasoning\n"
+                    "Medium effort: Balanced reasoning\n"
+                    "High effort: Detailed, multi-step reasoning")
+        ttk.Label(reasoning_frame, text=help_text, font=("TkDefaultFont", 8), 
+                foreground="gray").grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)   
+
+    #-------------------Mouse Wheel Scrolling & check tab changed-------------------------------
+
+    def on_tab_changed(self, event):
+        """
+        Tätä kutsutaan, kun Notebookin välilehti vaihtuu.
+        Päivitetään active_canvas oikeaksi.
+        """
+        selected_tab = self.notebook.select()  # Hanki ID:n valitulle tabille.
+
+        if selected_tab == str(self.main_tab):
+            self.active_canvas = self.chat_canvas
+        elif selected_tab == str(self.settings_tab):
+            self.active_canvas = self.settings_canvas
+        # Voit lisätä ehtoja, jos sinulla on enemmän tabeja.
+
+        # Varmistetaan, että vieritysalue päivittyy uuden canvaksen koon mukaan
+        if self.active_canvas == self.settings_canvas:
+            self.on_frame_configure(None)
+
+    def on_mousewheel_windows(self, event):
+        # Käytä self.active_canvas-muuttujaa!
+        self.active_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def on_mousewheel_mac(self, event):
+        # Käytä self.active_canvas-muuttujaa!
+        self.active_canvas.yview_scroll(int(-1 * (event.delta)), "units")
+
+    def on_mousewheel_linux(self, event):
+        # Käytä self.active_canvas-muuttujaa!
+        if event.num == 4:
+            self.active_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.active_canvas.yview_scroll(1, "units")
+
+    #------------------------Message Display & UI Updates----------------------------
+
+    def append_message(self, text, sender="system"):
+        self.after(0, self._append_message, text, sender)    
+
+    def _append_message(self, text, sender):
+        """
+        Display messages in the chat area with different styling for system/user/assistant.
+        Consecutive system messages are grouped under a single collapsible indicator.
+        """
+        # Store all messages in chat history regardless of visibility
+        timestamp = datetime.now().strftime('%H:%M')
+        self.chat_history.append({"text": text, "sender": sender, "timestamp": timestamp})
+        
+        # Check if this is a system message that should be grouped
+        if sender == "system":
+            # Get the last frame that was added (if any)
+            last_frame = None
+            if hasattr(self, "last_message_frame") and self.last_message_frame:
+                last_frame = self.last_message_frame
+                
+            # Check if the last frame was a system message group
+            if last_frame and hasattr(last_frame, "is_system_group") and last_frame.is_system_group:
+                # Add this message to the existing group
+                content_frame = last_frame.content_frame
+                
+                # Add a separator if there are already messages
+                if content_frame.winfo_children():
+                    separator = tk.Frame(content_frame, height=1, bg="#DDDDDD")
+                    separator.pack(fill=tk.X, pady=2)
+                
+                # Add the new message
+                msg_bubble = tk.Label(
+                    content_frame,
+                    text=text,
+                    bg="#FFCCCB",
+                    fg="black",
+                    padx=10,
+                    pady=5,
+                    wraplength=400,
+                    justify="left",
+                    relief="groove",
+                    borderwidth=1
+                )
+                msg_bubble.pack(fill=tk.X, anchor="w")
+                
+                # Add timestamp
+                time_label = tk.Label(
+                    content_frame,
+                    text=timestamp,
+                    bg="#ECE5DD",
+                    fg="gray",
+                    font=("Arial", 8)
+                )
+                time_label.pack(anchor="w")
+                
+                # Update the message count in the indicator
+                last_frame.message_count += 1
+                last_frame.indicator.config(text=f"➕ {last_frame.message_count} System Messages")
+                
+                # Update scroll
+                self.chat_canvas.update_idletasks()
+                self.chat_canvas.yview_moveto(1.0)
+                return
+        
+        # If we reached here, we're either:
+        # 1. Not a system message
+        # 2. First system message in a new group
+        
+        # Create a new message frame
+        if sender == "user":
+            bg_color = "#DCF8C6"
+            anchor = "e"
+            fg_color = "black"
+        elif sender == "assistant":
+            bg_color = "#FFFFFF"
+            anchor = "w"
+            fg_color = "black"
+        else:  # system messages
+            bg_color = "#FFCCCB"
+            anchor = "w"
+            fg_color = "black"
+        
+        msg_frame = tk.Frame(self.chat_inner_frame, bg="#ECE5DD", padx=10, pady=5)
+        msg_frame.pack(fill=tk.BOTH, expand=True, anchor=anchor)
+        self.last_message_frame = msg_frame
+        
+        # For system messages, create a collapsible group
+        if sender == "system":
+            # Mark this frame as a system group
+            msg_frame.is_system_group = True
+            msg_frame.message_count = 1
+            
+            # Create a collapsed indicator
+            collapsed_frame = tk.Frame(msg_frame, bg="#ECE5DD")
+            collapsed_frame.pack(fill=tk.X, anchor="w")
+            
+            indicator = tk.Label(
+                collapsed_frame,
+                text="➕ 1 System Message",
+                bg="#FFCCCB",
+                fg="black",
+                padx=5,
+                pady=2,
+                relief="groove",
+                borderwidth=1,
+                cursor="hand2"
+            )
+            indicator.pack(side=tk.LEFT, anchor="w")
+            msg_frame.indicator = indicator
+            
+            # Create content frame (initially hidden)
+            content_frame = tk.Frame(msg_frame, bg="#ECE5DD")
+            msg_frame.content_frame = content_frame
+            
+            # Add the message to the content frame
+            msg_bubble = tk.Label(
+                content_frame,
+                text=text,
+                bg=bg_color,
+                fg=fg_color,
+                padx=10,
+                pady=5,
+                wraplength=400,
+                justify="left",
+                relief="groove",
+                borderwidth=1
+            )
+            msg_bubble.pack(fill=tk.X, anchor=anchor)
+            
+            # Add timestamp
+            time_label = tk.Label(
+                content_frame,
+                text=timestamp,
+                bg="#ECE5DD",
+                fg="gray",
+                font=("Arial", 8)
+            )
+            time_label.pack(anchor=anchor)
+            
+            # Toggle function for this group
+            def toggle_system_group(event):
+                if content_frame.winfo_ismapped():
+                    content_frame.pack_forget()
+                    indicator.config(text=f"➕ {msg_frame.message_count} System Message{'s' if msg_frame.message_count > 1 else ''}")
+                else:
+                    content_frame.pack(fill=tk.X, anchor="w", pady=(5, 0))
+                    indicator.config(text=f"➖ {msg_frame.message_count} System Message{'s' if msg_frame.message_count > 1 else ''}")
+            
+            # Bind click event to the indicator
+            indicator.bind("<Button-1>", toggle_system_group)
+            
+        else:  # Regular user/assistant messages
+            bubble = tk.Label(
+                msg_frame,
+                text=text,
+                bg=bg_color,
+                fg=fg_color,
+                padx=10,
+                pady=5,
+                wraplength=400,
+                justify="left",
+                relief="groove",
+                borderwidth=1
+            )
+            bubble.pack(anchor=anchor)
+
+            time_label = tk.Label(
+                msg_frame,
+                text=timestamp,
+                bg="#ECE5DD",
+                fg="gray",
+                font=("Arial", 8)
+            )
+            time_label.pack(anchor=anchor)
+
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+    def append_image_in_chat(self, image_path, sender="user"):
+        self.after(0, self._append_image_in_chat, image_path, sender)
+
+    def _append_image_in_chat(self, image_path, sender):
+        """
+        Display an image in the chat area, using a label widget with a PhotoImage.
+        """
+        import os
+
+        if not os.path.exists(image_path):
+            self.append_message(f"Image not found: {image_path}", sender="system")
+            return
+
+        if sender == "user":
+            bg_color = "#DCF8C6"
+            anchor = "e"
+        elif sender == "assistant":
+            bg_color = "#FFFFFF"
+            anchor = "w"
+        else:
+            bg_color = "#FFCCCB"
+            anchor = "w"
+
+        try:
+            img = Image.open(image_path)
+            max_width = 300
+            if img.width > max_width:
+                wpercent = (max_width / float(img.width))
+                hsize = int(float(img.height) * float(wpercent))
+                img = img.resize((max_width, hsize), Image.Resampling.LANCZOS)
+
+            photo = ImageTk.PhotoImage(img)
+        except Exception as e:
+            self.append_message(f"Failed to load image: {e}", sender="system")
+            return
+
+        msg_frame = tk.Frame(self.chat_inner_frame, bg="#ECE5DD", padx=10, pady=5)
+        msg_frame.pack(fill=tk.BOTH, expand=True, anchor=anchor)
+
+        bubble = tk.Label(
+            msg_frame,
+            bg=bg_color,
+            image=photo,
+            padx=5,
+            pady=5,
+            relief="groove",
+            borderwidth=1
+        )
+        bubble.image = photo
+        bubble.pack(anchor=anchor)
+
+        timestamp = datetime.now().strftime('%H:%M')
+        time_label = tk.Label(
+            msg_frame,
+            text=timestamp,
+            bg="#ECE5DD",
+            fg="gray",
+            font=("Arial", 8)
+        )
+        time_label.pack(anchor=anchor)
+
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+    def update_status(self, status):
+        self.after(0, self._update_status, status)
+
+    def _update_status(self, status):
+        self.status_label.config(text=status)
+        if status in ["Idle", "Listening...", "Speaking completed"]:
+            self.status_label.config(fg="green")
+        elif status.startswith("Error"):
+            self.status_label.config(fg="red")
+        else:
+            self.status_label.config(fg="blue")
+
+    def clear_chat(self):
+        """
+        Tyhjentää kaikki viestit chat-ikkunasta, mutta säilyttää keskusteluhistorian.
+        """
+        for widget in self.chat_inner_frame.winfo_children():
+            widget.destroy()
+        
+        # Reset any references to message frames
+        self.last_message_frame = None
+        
+        # Use after() to ensure widgets are fully destroyed before adding new message
+        self.after(100, lambda: self.append_message("The chat has been cleared. You can start a new conversation.", sender="system"))
+        
+        # Scroll to top after widgets are updated
+        self.after(200, lambda: self.chat_canvas.yview_moveto(0))
+
+    def pulsing_animation(self, label, alpha=1.0, decreasing=True, interval=100):
+        """
+        Create a pulsing text effect by changing opacity gradually.
+        """
+        # Store animation state in the label to be able to stop it later
+        if not hasattr(label, "animation_running"):
+            label.animation_running = True
+        
+        # Stop the animation if it should no longer run
+        if not hasattr(label, "animation_running") or not label.animation_running:
+            return
+        
+        # Update alpha (opacity)
+        if decreasing:
+            alpha -= 0.1
+            if alpha <= 0.3:
+                decreasing = False
+        else:
+            alpha += 0.1
+            if alpha >= 1.0:
+                decreasing = True
+        
+        # Apply opacity to text color
+        gray_value = int(alpha * 255)
+        color = f"#{gray_value:02x}{gray_value:02x}{gray_value:02x}"
+        label.config(fg=color)
+        
+        # Schedule the next animation frame
+        self.after(interval, lambda: self.pulsing_animation(label, alpha, decreasing, interval))
+
+    def start_progress_bar(self, estimated_duration):
+        self.progress_bar['value'] = 0
+        self.progress_bar['maximum'] = estimated_duration * 1000  # ms
+        self._progress_start_time = time.time()
+        self.update_progress_bar()
+
+    def update_progress_bar(self, progress=None):
+        elapsed = (time.time() - self._progress_start_time) * 1000
+        self.progress_bar['value'] = elapsed
+        if elapsed < self.progress_bar['maximum']:
+            self.after(100, self.update_progress_bar)
+        else:
+            self.progress_bar['value'] = self.progress_bar['maximum']
+
+    #-------------------------Audio Processing----------------------------
 
     def start_listening(self):
         try:
+            # Check if using local Whisper but model isn't loaded
+            if self.use_local_whisper_var.get() and not self.whisper_model:
+                self.append_message("Loading local Whisper model first...", sender="system")
+                # Load the model before starting to listen
+                self.load_whisper_model()
+                # Wait a moment to let the loading start
+                time.sleep(1)
+            
+            # Rest of the existing start_listening code
             if not self.api_keys_provided:
                 messagebox.showerror("Error", "API keys are not set. Please enter and save your API keys first.")
                 return
@@ -1623,72 +2128,1615 @@ class ChatAudioApp5(tk.Tk):
             messagebox.showerror("Error", f"Failed to stop listening: {e}")
             self.append_message(f"Failed to stop listening: {e}", sender="system")
 
-    # --------------------------- Chess UI ---------------------------
-    def create_chess_frame(self, parent):
-        """Build the frame holding the chess canvas and controls."""
-        self.chess_frame = tk.Frame(parent)
+    def toggle_listening_state(self):
+        """Toggle between listening and paused states, stopping/starting streams."""
+        current_state = self.audio_source_toggle_var.get()
+        if current_state == "mute":
+            # Resuming listening
+            self.audio_source_toggle_var.set(self.last_audio_source)
+            self.start_listening()
+            self.listening_status_label.config(text="Listening Status: Active", fg="green")
+        else:
+            # Pausing listening
+            self.last_audio_source = current_state
+            self.stop_listening()
+            self.audio_source_toggle_var.set("mute")
+            self.listening_status_label.config(text="Listening Status: Paused", fg="red")
 
-        # Chess board canvas frame
-        self.chess_canvas_frame = tk.Frame(self.chess_frame)
-        self.chess_canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=10, pady=5)
+    def get_device_sample_rate(self, device_id):
+        """Query the default sample rate for the given device (input)."""
+        try:
+            device_info = sd.query_devices(device_id, 'input')
+            return int(device_info['default_samplerate'])
+        except Exception as e:
+            logging.error(f"Could not retrieve sample rate for device {device_id}: {e}")
+            return 44100
 
-        self.chess_canvas = tk.Canvas(
-            self.chess_canvas_frame,
-            width=self.square_size * 8,
-            height=self.square_size * 8
+    def get_device_input_channels(self, device_id):
+        """Return max input channels for the selected device or 1 if error."""
+        try:
+            device_info = sd.query_devices(device_id, 'input')
+            return device_info['max_input_channels']
+        except Exception as e:
+            logging.error(f"Could not retrieve channels for device {device_id}: {e}")
+            return 1
+
+    def get_input_audio_devices_for_combobox(self):
+        devices = []
+        try:
+            all_devices = sd.query_devices()
+            default_host_api = sd.query_hostapis(sd.default.hostapi)
+            host_api_name = default_host_api['name'].lower()
+
+            for idx, dev in enumerate(all_devices):
+                if dev['max_input_channels'] > 0:
+                    is_loopback = False
+                    if 'windows wasapi' in host_api_name:
+                        if 'loopback' in dev['name'].lower():
+                            is_loopback = True
+                    label = f"{dev['name']} (Chans: {dev['max_input_channels']})"
+                    devices.append((label, idx, is_loopback))
+        except Exception as e:
+            messagebox.showerror("Error Listing Devices", f"Could not list input audio devices:\n{e}")
+
+        if not devices:
+            devices.append(("No valid input devices found", None, False))
+
+        return devices
+
+    def get_output_audio_devices_for_combobox(self):
+        devices = []
+        try:
+            all_devices = sd.query_devices()
+            for idx, dev in enumerate(all_devices):
+                if dev['max_output_channels'] > 0:
+                    label = f"{dev['name']} (Output Chans: {dev['max_output_channels']})"
+                    devices.append((label, idx))
+        except Exception as e:
+            messagebox.showerror("Error Listing Devices", f"Could not list output audio devices:\n{e}")
+
+        if not devices:
+            devices.append(("No valid output devices found", None))
+
+        return devices  
+
+    def on_audio_source_change(self, *args):
+        """Update last_audio_source when audio source changes, excluding mute."""
+        current = self.audio_source_toggle_var.get()
+        if current != "mute":
+            self.last_audio_source = current   
+
+    def save_and_process_audio(self, recorded_frames, selected_language, client, openrouter_api_key, selected_model):
+        """Save recorded audio to file and process it with either OpenAI API or local Whisper"""
+        try:
+            self.update_status("Processing audio...")
+            
+            # Handle different array types and convert to int16
+            if isinstance(recorded_frames[0], np.ndarray):
+                audio_data = np.concatenate(recorded_frames, axis=0)
+            else:
+                # Convert from bytes to numpy array if needed
+                audio_arrays = []
+                for frame in recorded_frames:
+                    audio_arrays.append(np.frombuffer(frame, dtype=np.int16))
+                audio_data = np.concatenate(audio_arrays)
+            
+            # Save to temporary WAV file
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+                temp_filename = temp_wav.name
+                
+            wf = wave.open(temp_filename, 'wb')
+            wf.setnchannels(1)  # Assuming mono recording
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(self.sample_rate1)  # Use the sample rate from the recording
+            wf.writeframes(audio_data.tobytes())
+            wf.close()
+            
+            self.update_status("Transcribing audio...")
+            
+            # Check if we should use local Whisper or OpenAI API
+            if self.use_local_whisper_var.get() and self.whisper_model:
+                # Use local Whisper model
+                try:
+                    result = self.whisper_model.transcribe(temp_filename, language=selected_language)
+                    transcript = result["text"].strip()
+                    
+                    # Log and validate the transcription
+                    logging.info(f"Local Whisper transcription: '{transcript}'")
+                    
+                    if is_valid_transcription(transcript, blacklist=self.excluded_phrases):
+                        self.update_status("Processing transcription...")
+                        self.process_transcription(transcript, client, openrouter_api_key, selected_model)
+                    else:
+                        logging.info(f"Transcription filtered: '{transcript}'")
+                        self.update_status("Listening...")
+                except Exception as e:
+                    error_msg = f"Local Whisper transcription error: {str(e)}"
+                    logging.error(error_msg)
+                    self.handle_error(error_msg)
+                    self.update_status("Listening...")
+            else:
+                # Use OpenAI API (existing code)
+                try:
+                    with open(temp_filename, "rb") as audio_file:
+                        transcript = client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=audio_file,
+                            language=selected_language
+                        ).text
+                    
+                    # Log and validate the transcription
+                    logging.info(f"OpenAI API transcription: '{transcript}'")
+                    
+                    if is_valid_transcription(transcript, blacklist=self.excluded_phrases):
+                        self.update_status("Processing transcription...")
+                        self.process_transcription(transcript, client, openrouter_api_key, selected_model)
+                    else:
+                        logging.info(f"Transcription filtered: '{transcript}'")
+                        self.update_status("Listening...")
+                except Exception as e:
+                    error_msg = f"OpenAI API transcription error: {str(e)}"
+                    logging.error(error_msg)
+                    self.handle_error(error_msg)
+                    self.update_status("Listening...")
+            
+            # Clean up temporary file
+            try:
+                os.unlink(temp_filename)
+            except:
+                pass
+                
+        except Exception as e:
+            error_msg = f"Error processing audio: {str(e)}"
+            logging.error(error_msg)
+            self.handle_error(error_msg)
+            self.update_status("Listening...")
+
+    def _transcribe_audio(self, client, selected_language):
+        """Transcribe audio file and validate result"""
+        try:
+            with open(RECORDED_AUDIO_PATH, "rb") as audio_file:
+                transcription = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    language=selected_language
+                )
+                
+                lang_display = {
+                    'fi': "Finnish",
+                    'sv': "Swedish",
+                    'es': "Spanish"
+                }.get(selected_language, "English")
+                self.update_status("Recorded audio converted to text")
+                logging.info(f"User said ({lang_display}): {transcription.text}")
+                
+                # Validate transcription
+                if not is_valid_transcription(transcription.text, blacklist=self.excluded_phrases):
+                    self.update_status("Voice input failed")
+                    logging.info(f"Filtered out transcription: {transcription.text}")
+                    self.append_message(
+                        "Unrecognized or irrelevant audio was detected and ignored.",
+                        sender="system"
+                    )
+                    return None
+                    
+                self.append_message(transcription.text, sender="user")
+                return transcription.text
+                
+        except FileNotFoundError:
+            logging.error(f"File not found: {RECORDED_AUDIO_PATH}.")
+            self.handle_error(f"File not found: {RECORDED_AUDIO_PATH}")
+            return None
+
+    def _process_tts_audio_queue(self, audio_queue, playback_done, device_id):
+        """Process and play audio data from the queue"""
+
+
+        print("_process_tts_audio_queue: Started")
+        try:
+            stream = None
+            first_chunk = True
+            wav_header = None
+            
+            while not playback_done.is_set() or not audio_queue.empty():
+                try:
+                    audio_chunk = audio_queue.get(timeout=0.5)
+                    #print(f"_process_tts_audio_queue: Got chunk: {len(audio_chunk) if audio_chunk else None} bytes")
+                    
+                    if audio_chunk is not None:
+                        if first_chunk:
+                            # Extract WAV header info from first chunk
+                            with io.BytesIO(audio_chunk) as wav_io:
+                                wav = wave.open(wav_io, 'rb')
+                                channels = wav.getnchannels()
+                                sample_width = wav.getsampwidth()
+                                framerate = wav.getframerate()
+                                print(f"_process_tts_audio_queue: Channels: {channels}, Sample Width: {sample_width}, Framerate: {framerate}")
+                                
+                                # Create audio stream
+                                stream = sd.OutputStream(
+                                    samplerate=framerate,
+                                    channels=channels,
+                                    dtype=f'int{sample_width*8}',
+                                    device=device_id
+                                )
+                                print(f"_process_tts_audio_queue: Stream created: {stream}")
+                                stream.start()
+                                print(f"_process_tts_audio_queue: Stream started")
+                                
+                                # Process first chunk
+                                audio_data = np.frombuffer(
+                                    wav.readframes(wav.getnframes()),
+                                    dtype=np.int16
+                                )
+                                #print(f"_process_tts_audio_queue: Writing {len(audio_data)} samples to stream")
+                                stream.write(audio_data)
+                                first_chunk = False
+                        else:
+                            # Process subsequent chunks
+                            audio_data = np.frombuffer(audio_chunk, dtype=np.int16)
+                            #print(f"_process_tts_audio_queue: Writing {len(audio_data)} samples to stream")
+                            if stream is not None:
+                                stream.write(audio_data)
+                    
+                    audio_queue.task_done()
+                except queue.Empty:
+                    #print("_process_tts_audio_queue: Queue empty") # This can be noisy, so comment it out unless needed
+                    continue
+                except Exception as e:
+                    print(f"_process_tts_audio_queue: Error in playback: {e}") # CRITICAL: Print the exception
+                    logging.error(f"Error in audio playback: {e}")
+                    break
+            
+            if stream is not None:
+                print("_process_tts_audio_queue: Stopping stream")
+                stream.stop()
+                print("_process_tts_audio_queue: Closing stream")
+                stream.close()
+            print("_process_tts_audio_queue: Exiting")
+                    
+        except Exception as e:
+            logging.error(f"Audio playback thread error: {e}")
+            print(f"_process_tts_audio_queue: Outer exception: {e}")
+
+        finally:
+            print("_process_tts_audio_queue: Playback thread finished")
+
+    def get_vol_threshold(self):
+        try:
+            return float(self.vol_threshold_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Volume Threshold must be a number.")
+            return DEFAULT_VOL_THRESHOLD
+
+    def get_min_record_duration(self):
+        try:
+            return float(self.min_record_duration_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Minimum Record Duration must be a number.")
+            return DEFAULT_MIN_RECORD_DURATION
+
+    def get_max_silence_duration(self):
+        try:
+            return float(self.max_silence_duration_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Maximum Silence Duration must be a number.")
+            return DEFAULT_MAX_SILENCE_DURATION
+
+    #-------------------------TTS & Speech Generation----------------------
+
+    def save_tts_settings(self):
+        """Save TTS voice settings to config file"""
+        voice = self.tts_voice_var.get()
+        self.config_data['TTS_VOICE'] = voice
+        
+        # Save to config file
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config_data, f, indent=4)
+        
+        messagebox.showinfo("Settings Saved", "TTS voice settings saved successfully.")
+
+    def toggle_local_tts_settings(self):
+        """Enable or disable local TTS settings based on checkbox state"""
+        state = "normal" if self.use_local_tts_var.get() else "disabled"
+        self.gtts_lang_combobox.config(state=state)
+
+    def save_local_tts_settings(self):
+        """Save local TTS settings to config file"""
+        use_local = self.use_local_tts_var.get()
+        lang = self.gtts_lang_var.get()
+        
+        self.config_data['USE_LOCAL_TTS'] = use_local
+        self.config_data['GTTS_LANGUAGE'] = lang
+        
+        # Save to config file
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config_data, f, indent=4)
+        
+        if use_local and not GTTS_AVAILABLE:
+            messagebox.showwarning(
+                "Package Missing", 
+                "gTTS is not installed. Please run 'pip install gtts playsound==1.2.2' to use local TTS."
+            )
+        else:
+            messagebox.showinfo("Settings Saved", "Local TTS settings saved successfully.")
+
+    def generate_local_tts(self, text, language=None):
+        """Generate speech using local gTTS and return the audio file path"""
+        if not GTTS_AVAILABLE:
+            self.append_message("Error: gTTS not installed. Run 'pip install gtts playsound==1.2.2'", sender="system")
+            return None
+        
+        try:
+            # Create a temporary file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+            temp_file.close()
+            
+            # Use specified language or default from settings
+            lang = language or self.gtts_lang_var.get()
+            
+            # Generate speech
+            self.update_status("Generating speech with gTTS...")
+            tts = gTTS(text=text, lang=lang, slow=False)
+            tts.save(temp_file.name)
+            
+            return temp_file.name
+        except Exception as e:
+            error_msg = f"Error generating local TTS: {str(e)}"
+            logging.error(error_msg)
+            self.append_message(error_msg, sender="system")
+            return None
+
+    def play_local_audio(self, audio_file):
+        """Play a local audio file with error handling"""
+        try:
+            self.update_status("Playing audio...")
+            
+            # Store current audio source state and mute
+            self.audio_source_toggle_var.set("mute")
+            
+            # Play the audio
+            playsound(audio_file)
+            
+            # Clean up the file afterwards
+            try:
+                os.unlink(audio_file)
+            except:
+                pass
+            
+            # Restore original audio state
+            if hasattr(self, 'saved_audio_state'):
+                self.audio_source_toggle_var.set(self.saved_audio_state)
+            
+            self.update_status("Audio playback completed")
+        except Exception as e:
+            error_msg = f"Error playing audio: {str(e)}"
+            logging.error(error_msg)
+            self.append_message(error_msg, sender="system")
+            
+            # Ensure we restore audio state even on error
+            if hasattr(self, 'saved_audio_state'):
+                self.audio_source_toggle_var.set(self.saved_audio_state)
+
+    def _tts_worker(self, tts_queue):
+        """Modified worker that handles TTS with automatic muting and unmuting."""
+        
+        while True:
+            text = tts_queue.get()
+            if text is None or self.skip_tts_var.get():
+                break  # Exit when None is received
+
+            # Combine multiple sentences if available
+            while not tts_queue.empty():
+                next_text = tts_queue.get()
+                if next_text is None:
+                    tts_queue.put(None)  # Put back the None to signal end
+                    break
+                text += " " + next_text
+                # Limit text length to avoid overwhelming TTS
+                if len(text) > 3000:
+                    break
+
+            try:
+                self.tts_queue_completed = False  # Reset flag
+            
+
+                # Store current audio source state and mute
+                print("muted by tts")
+                self.audio_source_toggle_var.set("mute")
+                self.update_status("AI speaking...")
+
+                selected_language = self.map_language_to_code(self.language_var.get())
+
+                if selected_language != "en":
+                    # Convert numbers to spoken words for languages other than English
+                    text_with_spoken_numbers = self.convert_numbers_to_words(text, selected_language)
+                else:
+                    text_with_spoken_numbers = text
+                
+                # Check if we should use local TTS
+                if self.config_data.get('USE_LOCAL_TTS', False) and GTTS_AVAILABLE:
+                    # Use local gTTS
+                    audio_file = self.generate_local_tts(
+                        text_with_spoken_numbers, 
+                        language=self.config_data.get('GTTS_LANGUAGE', 'en')
+                    )
+                    
+                    if audio_file:
+                        self.play_local_audio(audio_file)
+                        self.tts_queue_completed = True
+                else:
+                    # Use API-based TTS (existing implementation)
+                    # Get output device
+                    selected_output_index = self.audio_output_combobox.current()
+                    device_id = None
+                    if selected_output_index >= 0 and self.available_output_devices:
+                        _, device_id = self.available_output_devices[selected_output_index]
+
+                    # Use stream API for TTS with blocking until complete
+                    self.stream_api_response(
+                        api_type = "tts",
+                        request_params = {
+                            "api_key": self.openai_key,
+                            "text": text_with_spoken_numbers,
+                            "device_id": device_id,
+                        },
+                        on_chunk_received = lambda chunk, first: None,
+                        on_complete = None
+                    )
+
+                    print("full TTS playback complete")
+                    self.tts_queue_completed = True
+
+                def unmute_after_tts():
+                    if self.current_tts_stream_completed or self.tts_queue_completed:
+                        # Reset listening queues before unmuting
+                        while not self.audio_queue1.empty():
+                            self.audio_queue1.get()
+                        while not self.audio_queue2.empty():
+                            self.audio_queue2.get()
+                            
+                        # Restore original saved audio state instead of any intermediate state
+                        original_state = self.saved_audio_state  # Use the originally saved state
+                        print(f"unmuted by tts - restoring original state: {original_state}")
+                        self.audio_source_toggle_var.set(original_state)
+                        self.update_status("Listening...")                        
+                    else:
+                        self.after(1000, unmute_after_tts)
+                self.after(1000, unmute_after_tts)
+                    
+            except Exception as e:
+                logging.error(f"Error during TTS processing: {e}")
+                self.after(0, lambda: self.append_message(f"Error during TTS: {e}", sender='system'))
+
+                # Ensure we restore audio state even on error
+                original_state = self.saved_audio_state
+                print(f"unmuted by tts - restoring original state: {original_state}")
+                self.audio_source_toggle_var.set(original_state)
+                self.update_status("Listening...")
+
+            tts_queue.task_done()
+
+    def convert_numbers_to_words(self, text, language='fi'):
+        """
+        Convert numbers in text to their word representations for better TTS.
+        
+        Args:
+            text (str): Text containing numbers
+            language (str): Language code for conversion (fi, en, sv, es)
+        
+        Returns:
+            str: Text with numbers converted to words
+        """
+        if not text:
+            return text
+        
+        # Map language codes from the app to num2words format
+        lang_map = {
+            'fi': 'fi',
+            'en': 'en',
+            'sv': 'sv',
+            'es': 'es'
+        }
+        
+        # Get appropriate language code
+        lang = lang_map.get(language, 'en')
+        
+        # Function to convert a matched number
+        def replace_number(match):
+            try:
+                num = match.group(0).replace(',', '.')  # Handle decimal comma format
+                # Convert only numbers that look reasonable to convert (not very long numbers)
+                if len(num) > 15:  # Skip very long numbers
+                    return match.group(0)
+                    
+                # Handle decimal numbers
+                if '.' in num:
+                    integer_part, decimal_part = num.split('.')
+                    if integer_part:
+                        integer_words = num2words(int(integer_part), lang=lang)
+                    else:
+                        integer_words = "zero"
+                    
+                    # Handle decimal part differently based on language
+                    if decimal_part:
+                        if lang == 'fi':
+                            decimal_words = " pilkku " + " ".join([num2words(int(d), lang=lang) for d in decimal_part])
+                        else:
+                            decimal_words = " point " + " ".join([num2words(int(d), lang=lang) for d in decimal_part])
+                        return f"{integer_words}{decimal_words}"
+                    else:
+                        return integer_words
+                else:
+                    # Handle integers
+                    return num2words(int(num), lang=lang)
+            except Exception as e:
+                logging.error(f"Error converting number '{match.group(0)}' to words: {e}")
+                return match.group(0)
+        
+        # Find numbers (allowing for decimal notation) and replace them
+        processed_text = re.sub(r'\b\d+[,\.]?\d*\b', replace_number, text)
+        return processed_text
+
+    def _speak_thinking_summary(self, summary, is_final=False):
+        """
+        Queue the thinking summary to be spoken without overlapping.
+        
+        Args:
+            summary (str): The summary to speak
+            is_final (bool): Whether this is the final thinking summary
+        """
+        try:
+            # Start the worker if not already running
+            if not self.thinking_tts_active:
+                self.thinking_tts_worker = threading.Thread(
+                    target=self._thinking_tts_worker,
+                    daemon=True
+                )
+                self.thinking_tts_worker.start()
+            
+            # Priority: 1 for final summaries, 0 for regular ones
+            priority = 1 if is_final else 0
+            
+            # If a high priority message and speech is in progress, signal to stop
+            if priority == 1 and hasattr(self, 'speech_in_progress') and self.speech_in_progress.is_set():
+                self.thinking_tts_should_stop.set()
+                # Allow a moment for current speech to stop
+                time.sleep(0.2)
+                self.thinking_tts_should_stop.clear()
+            
+            # For regular priority messages, check if we should skip due to ongoing speech
+            elif priority == 0 and hasattr(self, 'speech_in_progress') and self.speech_in_progress.is_set():
+                # Skip non-final messages if speech is already in progress
+                return
+                
+            # Add to queue
+            self.thinking_tts_queue.put((summary, is_final, priority))
+            
+        except Exception as e:
+            logging.error(f"Error queueing thinking summary: {e}")
+
+    def _thinking_tts_worker(self):
+        """
+        Worker thread that processes thinking summaries from the queue
+        and ensures they don't overlap when spoken.
+        """
+        self.thinking_tts_active = True
+        self.thinking_tts_should_stop = threading.Event()
+        self.speech_in_progress = threading.Event()  # Track when speech is playing
+        
+        try:
+            last_speech_time = 0
+            min_interval_between_speech = 3.0  # Increased interval between thinking summaries
+            
+            while self.thinking_tts_active and not self.thinking_tts_should_stop.is_set():
+                try:
+                    # Get the next item (blocking with timeout)
+                    item = self.thinking_tts_queue.get(timeout=0.5)
+                    if item is None or self.skip_tts_var.get():
+                        # None is the signal to stop
+                        break
+                        
+                    summary, is_final, priority = item
+                    
+                    # Ensure we don't speak too frequently by checking time since last speech
+                    time_since_last_speech = time.time() - last_speech_time
+                    if time_since_last_speech < min_interval_between_speech and not is_final:
+                        # Skip this thinking update if it's too soon after the previous one
+                        # unless it's the final summary
+                        self.thinking_tts_queue.task_done()
+                        continue
+                    
+                    # Check if we should stop before starting new audio
+                    if self.thinking_tts_should_stop.is_set():
+                        self.thinking_tts_queue.task_done()
+                        break
+                    
+                    # Process this thinking summary
+                    selected_output_index = self.audio_output_combobox.current()
+                    device_id = None
+                    if selected_output_index >= 0 and self.available_output_devices:
+                        _, device_id = self.available_output_devices[selected_output_index]
+                    
+                    # Convert to speech
+                    selected_language = self.map_language_to_code(self.language_var.get())
+                    text_with_spoken_numbers = self.convert_numbers_to_words(summary, selected_language)
+                    
+                    # Mark speech as in progress
+                    self.speech_in_progress.set()
+                    
+                    # Check if we should use local TTS
+                    if self.config_data.get('USE_LOCAL_TTS', False) and GTTS_AVAILABLE:
+                        # Use local gTTS
+                        audio_file = self.generate_local_tts(
+                            text_with_spoken_numbers, 
+                            language=self.config_data.get('GTTS_LANGUAGE', 'en')
+                        )
+                        
+                        if audio_file:
+                            # Check for stop signal before playing
+                            if not self.thinking_tts_should_stop.is_set():
+                                # Save current audio state and mute
+                                original_state = self.audio_source_toggle_var.get()
+                                self.audio_source_toggle_var.set("mute")
+                                
+                                # Play the audio file
+                                try:
+                                    playsound(audio_file)
+                                    
+                                    # Clean up file after playing
+                                    try:
+                                        os.unlink(audio_file)
+                                    except:
+                                        pass
+                                except Exception as e:
+                                    logging.error(f"Error playing thinking TTS audio: {e}")
+                                finally:
+                                    # Restore audio state
+                                    self.audio_source_toggle_var.set(original_state)
+                            
+                            last_speech_time = time.time()
+                            self.speech_in_progress.clear()
+                        else:
+                            # If generation failed, skip speaking
+                            self.speech_in_progress.clear()
+                            logging.error("Failed to generate local TTS audio for thinking")
+                    else:
+                        # Use API-based TTS
+                        stream_params = {
+                            "api_key": self.openai_key,
+                            "text": text_with_spoken_numbers,
+                            "device_id": device_id,
+                        }
+                        
+                        def check_stop_signal(chunk, is_first):
+                            # Return whether to continue streaming
+                            return not self.thinking_tts_should_stop.is_set()
+                        
+                        # This will block until the speech is complete
+                        self.stream_api_response(
+                            "tts", 
+                            stream_params, 
+                            check_stop_signal
+                        )
+                        
+                        last_speech_time = time.time()
+                        
+                        # Mark speech as complete
+                        self.speech_in_progress.clear()
+                    
+                    # Add a small pause after speech to ensure clean transition
+                    time.sleep(0.3)
+                    
+                    # Add a longer pause after final speech
+                    if is_final:
+                        time.sleep(0.5)
+                    
+                    self.thinking_tts_queue.task_done()
+                    
+                except queue.Empty:
+                    # Queue timeout, check if we should continue
+                    continue
+        except Exception as e:
+            logging.error(f"Error in thinking TTS worker: {e}")
+        finally:
+            self.thinking_tts_active = False
+            self.thinking_tts_should_stop.clear()
+            self.speech_in_progress.clear()
+
+    def stop_thinking_tts(self):
+        """Stop any ongoing thinking TTS playback"""
+        if hasattr(self, 'thinking_tts_should_stop'):
+            self.thinking_tts_should_stop.set()
+            
+        # Clear the queue
+        if hasattr(self, 'thinking_tts_queue'):
+            while not self.thinking_tts_queue.empty():
+                try:
+                    self.thinking_tts_queue.get_nowait()
+                    self.thinking_tts_queue.task_done()
+                except queue.Empty:
+                    break
+                    
+        # Signal end
+        self.thinking_tts_queue.put(None)
+
+    #-------------------------LLM Communication----------------------
+
+    def send_message(self, messages, image_path=None, language='fi', openrouter_api_key='', model='default-model', reasoning_effort='medium', show_reasoning=True):
+        """
+        Unified function to send messages to either Ollama or OpenRouter, handling streaming and TTS.
+        """
+        if not hasattr(self, 'in_message_processing') or not self.in_message_processing:
+            self.saved_audio_state = self.audio_source_toggle_var.get()
+            self.in_message_processing = True
+            print(f"send_message: Saved audio state: {self.saved_audio_state}")
+
+        if model.startswith("ollama/"):
+            # Use Ollama
+            return self.send_message_to_ollama(messages, image_path, language, model, reasoning_effort, show_reasoning)
+        else:
+            # Use OpenRouter (existing logic)
+            return self.send_message_to_openrouter(messages, image_path, language, openrouter_api_key, model, reasoning_effort, show_reasoning)
+ 
+    def send_message_to_ollama(self, messages, image_path=None, language='fi', model='ollama/llama3', reasoning_effort='medium', show_reasoning=True):
+        """
+        Sends a message to an Ollama model, streams the response, and starts TTS playback.
+        """
+        try:
+            # Debug which Ollama model is being used
+            model_name = model.replace("ollama/", "", 1)
+            print(f"Using Ollama model: {model_name}")
+            
+            # Process image path if provided
+            if image_path is not None:
+                # Create a copy of messages to avoid modifying the original list
+                modified_messages = [msg.copy() for msg in messages]
+                last_user_msg_idx = -1
+                # Find the last user message
+                for i in reversed(range(len(modified_messages))):
+                    if modified_messages[i].get('role') == 'user':
+                        last_user_msg_idx = i
+                        break
+                if last_user_msg_idx != -1:
+                    # Add the image to the existing user message
+                    if 'images' not in modified_messages[last_user_msg_idx]:
+                        modified_messages[last_user_msg_idx]['images'] = []
+                    modified_messages[last_user_msg_idx]['images'].append(image_path)
+                else:
+                    # Append a new user message with the image
+                    modified_messages.append({
+                        'role': 'user',
+                        'content': '',  # Default content if none provided
+                        'images': [image_path]
+                    })
+                messages = modified_messages
+            
+            # Initialize the client
+            ollama_client = ollama.Client()
+            
+            # Create a queue for TTS sentences
+            tts_queue = queue.Queue()
+
+            # Start the TTS worker thread
+            tts_worker = threading.Thread(target=self._tts_worker, args=(tts_queue,), daemon=True)
+
+
+            tts_worker.start()
+
+            # Initialize variables for response tracking
+            accumulated_text = ""
+            processed_up_to = 0
+            thinking_buffer = ""
+            last_thinking_summary_time = time.time()
+            thinking_summary_interval = 3.0
+            in_thinking_mode = False
+            
+            # Add a placeholder message in the chat UI
+            self.append_message("Thinking...", sender="assistant")
+
+            # Define chunk handler for Ollama streaming
+            def process_ollama_chunk(chunk):
+                nonlocal accumulated_text, processed_up_to, thinking_buffer, last_thinking_summary_time, in_thinking_mode
+
+                # Ollama's response structure is different from OpenRouter.
+                if hasattr(chunk, 'message') and hasattr(chunk.message, 'content'):
+                    # New chat API format
+                    partial_content = chunk.message.content or ''
+                else:
+                    # Old generate API format
+                    partial_content = chunk.get('response', '') or ''
+                    
+                    # Debug the content received
+                    print(f"Ollama chunk received: {partial_content}")
+                    print(f"Raw chunk: {chunk}")
+                
+                if partial_content:
+                    # Check for thinking mode markers
+                    if "<think>" in partial_content and not in_thinking_mode:
+                        # Start of thinking mode
+                        in_thinking_mode = True
+                        # Start accumulated text with thinking emoji
+                        if not accumulated_text.startswith("🤔"):
+                            accumulated_text = "🤔 "
+                        thinking_buffer = ""  # Reset thinking buffer
+                    
+                    if in_thinking_mode:
+                        # Handle content in thinking mode
+                        if "</think>" in partial_content:
+                            # End of thinking mode
+                            in_thinking_mode = False
+                            
+                            # Split the content before and after </think>
+                            parts = partial_content.split("</think>", 1)
+                            
+                            # Add final part of thinking to buffer
+                            thinking_buffer += parts[0]
+                            
+                            # Create a final summary of the thinking
+                            if show_reasoning:
+                                summary = self._create_thinking_summary(thinking_buffer, is_final=True)
+                                if summary:
+                                    self._speak_thinking_summary(summary, True)
+                            
+                            # Reset accumulated text for the actual response
+                            accumulated_text = ""
+                            processed_up_to = 0
+                            
+                            # Process the part after </think> if it exists
+                            if len(parts) > 1 and parts[1].strip():
+                                accumulated_text += parts[1]
+                                self._update_last_message(accumulated_text)
+                        else:
+                            # Still in thinking mode
+                            thinking_buffer += partial_content
+                            
+                            if show_reasoning:
+                                # Add to accumulated text with thinking prefix
+                                accumulated_text += partial_content
+                                self._update_last_message(accumulated_text)
+                                
+                                # Check if it's time to create a thinking summary
+                                current_time = time.time()
+                                if current_time - last_thinking_summary_time > thinking_summary_interval and len(thinking_buffer) > 50:
+                                    # Create a summary of the thinking
+                                    summary = self._create_thinking_summary(thinking_buffer)
+                                    
+                                    # Speak the summary without showing it in chat
+                                    if summary:
+                                        # Use a separate thread to avoid blocking
+                                        summary_thread = threading.Thread(
+                                            target=self._speak_thinking_summary,
+                                            args=(summary,),
+                                            daemon=True
+                                        )
+                                        summary_thread.start()
+                                    
+                                    # Reset for next summary but keep some recent context
+                                    last_thinking_summary_time = current_time
+                    else:
+                        # Normal content (not in thinking mode)
+                        accumulated_text += partial_content
+                        
+                        # Make sure to update UI immediately
+                        self._update_last_message(accumulated_text)
+                        
+                        # Find complete sentences for TTS (same as in send_message_to_openrouter)
+                        while True:
+                            sentence_end = accumulated_text.find('.', processed_up_to)
+                            if sentence_end == -1:
+                                sentence_end = accumulated_text.find('!', processed_up_to)
+                            if sentence_end == -1:
+                                sentence_end = accumulated_text.find('?', processed_up_to)
+                            if sentence_end == -1:
+                                break  # No complete sentence yet
+                                
+                            # Extract and queue the sentence
+                            sentence = accumulated_text[processed_up_to:sentence_end + 1].strip()
+                            if sentence:
+                                # First, remove complete image prompts with brackets
+                                cleaned_sentence = re.sub(r'\[CREATE_IMAGE:.*?\]', '', sentence).strip()
+                                
+                                # Check for any "CREATE_IMAGE:" text with or without brackets
+                                if 'CREATE_IMAGE:' in cleaned_sentence:
+                                    # Cut off everything from CREATE_IMAGE: to the end, regardless of brackets
+                                    cleaned_sentence = cleaned_sentence.split('CREATE_IMAGE:')[0].strip()
+                                    
+                                if cleaned_sentence:  # Only queue if there's content after cleaning
+                                    sentence = cleaned_sentence
+                                    tts_queue.put(sentence)
+                                sentence = cleaned_sentence
+                            processed_up_to = sentence_end + 1
+            
+            # Define completion handler (Ollama-specific)
+            def on_ollama_complete():
+                nonlocal accumulated_text, processed_up_to, thinking_buffer, in_thinking_mode
+
+                # If we were in thinking mode and have buffer left, create a final summary
+                if in_thinking_mode and thinking_buffer:
+                    summary = self._create_thinking_summary(thinking_buffer, is_final=True)
+                    if summary and show_reasoning:
+                        # Queue the final thinking summary with highest priority
+                        self._speak_thinking_summary(summary, True)
+
+                        # Signal the end of thinking summaries
+                        self.thinking_tts_queue.put(None)
+                else:
+                    # If we weren't in thinking mode, make sure any thinking TTS is stopped
+                    self.stop_thinking_tts()
+
+                # Add any remaining text to the queue
+                if processed_up_to < len(accumulated_text):
+                    remaining_text = accumulated_text[processed_up_to:].strip()
+                    if remaining_text:
+                        tts_queue.put(remaining_text)
+                        
+                # Signal the TTS worker to stop
+                tts_queue.put(None)
+
+                # Check for image generation requests
+                if "[CREATE_IMAGE:" in accumulated_text:
+                    try:
+                        image_start = accumulated_text.find("[CREATE_IMAGE:")
+                        image_end = accumulated_text.find("]", image_start)
+                        if image_end > image_start:
+                            image_prompt = accumulated_text[image_start + 14:image_end].strip()
+
+                            # Clean the response for display
+                            cleaned_response = accumulated_text[:image_start].rstrip()
+                            self._update_last_message(cleaned_response)
+
+                            # Mark image as processed and generate it
+                            self.last_image_processed = image_prompt
+                            self.display_generated_image(image_prompt)
+                    except Exception as e:
+                        logging.error(f"Error extracting image prompt: {e}")
+
+            print(f"Sending conversation with {len(messages)} messages to Ollama") 
+            response_iter = ollama_client.chat(model=model_name, messages=messages, stream=True)
+
+            # Process each chunk as it comes in
+            for chunk in response_iter:
+                process_ollama_chunk(chunk)
+                
+            # Call completion handler when done
+            on_ollama_complete()
+            
+            # Return a response object similar to OpenRouter's format
+            # Clean up any thinking tags in the final response
+            final_text = accumulated_text
+            if "<think>" in final_text or "</think>" in final_text:
+                final_text = re.sub(r'<think>.*?</think>', '', final_text, flags=re.DOTALL).strip()
+            
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": final_text,
+                            "role": "assistant"
+                        }
+                    }
+                ]
+            }
+            
+        except Exception as e:
+            error_message = f"An unexpected error occurred with Ollama: {e}"
+            logging.error(error_message)
+            self.after(0, lambda: self.append_message(error_message, sender="system"))
+            return None
+
+    def send_message_to_openrouter(self, messages, image_path=None, language='fi', openrouter_api_key='', model='default-model', reasoning_effort='medium', show_reasoning=True):
+        """
+        Sends a message to the OpenRouter API, streams the LLM response, and starts TTS playback as sentences are completed.
+
+        Args:
+            messages (list): List of message dictionaries with 'role' and 'content'.
+            image_path (str, optional): Path to an image to include in the request.
+            language (str): Language code for the response (default: 'fi').
+            openrouter_api_key (str): API key for OpenRouter.
+            model (str): LLM model to use (default: 'default-model').
+            reasoning_effort (str): Level of reasoning effort ('low', 'medium', 'high').
+            show_reasoning (bool): Whether to include reasoning in the response.
+
+        Returns:
+            dict: Response object mimicking the non-streaming API response structure.
+        """
+
+
+        # Prepare personality prompt
+        base_personality_prompt = self.config_data.get('LLM_PERSONALITY', '')
+        current_game = self.game_var.get()
+
+        # Prepare game-specific personality prompt
+        if current_game != "Chess" and not self.skip_dalle_var.get():
+            image_generation_instruction = (
+                "\nIf you feel like providing image or in case user says something like ...I would like to see an image of... "
+                "just include description of the image in English (ENGLISH!) on the last line of your reply like this: \n"
+                "[CREATE_IMAGE: <prompt text>]\n"
+                "(Make sure to include the square brackets as shown)."
+                "No math in latex format. Use simple math expressions like 2+2=4."
+            )
+            final_personality_prompt = base_personality_prompt + image_generation_instruction + "\n Do not use emojis when thinking."
+        else:
+            final_personality_prompt = base_personality_prompt + "\n Do not use emojis when thinking."
+
+        # Add system message if needed
+        game_changed = hasattr(self, 'previous_game') and current_game != self.previous_game
+        self.previous_game = current_game
+
+        if final_personality_prompt and (game_changed or not messages or messages[0].get("role") != "system"):
+            if messages and messages[0].get("role") == "system":
+                messages.pop(0)
+            messages.insert(0, {"role": "system", "content": final_personality_prompt})
+
+        # Process image if present
+        if image_path and messages and messages[-1]['role'] == 'user':
+            base64_image = encode_image(image_path)  # Assume encode_image is defined elsewhere
+            if base64_image:
+                if isinstance(messages[-1]['content'], list):
+                    messages[-1]['content'].append(
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+                    )
+                else:
+                    existing_text = messages[-1]['content']
+                    messages[-1]['content'] = [
+                        {"type": "text", "text": existing_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+                    ]
+
+        # Prepare data for the API request
+        data = {
+            "model": model,
+            "messages": messages,
+            "language": language,
+            "stream": True,
+            "reasoning": {
+                "effort": reasoning_effort,
+                "exclude": not show_reasoning
+            }
+        }
+
+        # Create a queue for TTS sentences
+        tts_queue = queue.Queue()
+
+        # Start the TTS worker thread
+        tts_worker = threading.Thread(target=self._tts_worker, args=(tts_queue,), daemon=True)
+        tts_worker.start()
+
+        # Initialize variables for response tracking
+        accumulated_text = ""
+        processed_up_to = 0
+        
+        # New variables for tracking thinking process
+        thinking_buffer = ""
+        last_thinking_summary_time = time.time()
+        thinking_summary_interval = 3.0  # Summarize every 3 seconds
+        in_thinking_mode = False
+
+        # Define chunk handler for LLM streaming
+        def process_llm_chunk(data_obj):
+            nonlocal accumulated_text, processed_up_to, thinking_buffer, last_thinking_summary_time, in_thinking_mode
+            if "choices" in data_obj and data_obj["choices"] and "delta" in data_obj["choices"][0]:
+                delta = data_obj["choices"][0]["delta"]
+
+                # Check for reasoning content in the delta
+                reasoning = delta.get("reasoning", "")
+                partial_content = delta.get("content", "")
+                
+                # If we have reasoning content, prepend the thinking emoji
+                if reasoning and show_reasoning:
+                    # We're in thinking mode
+                    in_thinking_mode = True
+                    
+                    # Add to thinking buffer
+                    thinking_buffer += reasoning
+                    
+                    # Add thinking emoji prefix if this is new reasoning content
+                    if not accumulated_text.startswith("🤔"):
+                        accumulated_text = "🤔 " + reasoning
+                    else:
+                        accumulated_text += reasoning
+                    
+                    # Update UI with reasoning text
+                    self._update_last_message(accumulated_text)
+                    
+                    # Check if it's time to create a thinking summary
+                    current_time = time.time()
+                    if current_time - last_thinking_summary_time > thinking_summary_interval and len(thinking_buffer) > 50:
+                        # Create a summary of the thinking
+                        summary = self._create_thinking_summary(thinking_buffer)
+                        
+                        # Speak the summary without showing it in chat
+                        if summary:
+                            # Use a separate thread to avoid blocking
+                            summary_thread = threading.Thread(
+                                target=self._speak_thinking_summary,
+                                args=(summary,),
+                                daemon=True
+                            )
+                            summary_thread.start()
+                        
+                        # Reset for next summary
+                        thinking_buffer = ""  # Keep some context
+                        last_thinking_summary_time = current_time
+                
+                # If we have regular content, use that instead
+                elif partial_content:
+                    # If switching from reasoning to regular content, reset accumulated_text
+                    if accumulated_text.startswith("🤔"):
+
+                        accumulated_text = ""
+                        processed_up_to = 0
+                        in_thinking_mode = False
+                        thinking_buffer = ""  # Clear thinking buffer
+                        
+                        # Stop thinking TTS to prevent audio overlap
+                        if self.thinking_tts_active:
+
+                            # Signal end of thinking summaries but with a slight delay
+                            self.after(800, lambda: self.thinking_tts_queue.put(None))
+
+                            # Clear the thinking TTS queue
+                            while not self.thinking_tts_queue.empty():
+                                try:
+                                    self.thinking_tts_queue.get_nowait()
+                                    self.thinking_tts_queue.task_done()
+                                except queue.Empty:
+                                    break
+                            
+                            # Signal end of thinking summaries
+                            self.thinking_tts_queue.put(None)
+                            
+                            # Add a small delay to ensure audio output transitions smoothly
+                            time.sleep(0.3)
+                    
+                    accumulated_text += partial_content
+
+                    # Find complete sentences for TTS
+                    while True:
+                        # Look for sentence-ending punctuation
+                        sentence_end = accumulated_text.find('.', processed_up_to)
+                        if sentence_end == -1:
+                            sentence_end = accumulated_text.find('!', processed_up_to)
+                        if sentence_end == -1:
+                            sentence_end = accumulated_text.find('?', processed_up_to)
+                        if sentence_end == -1:
+                            break  # No complete sentence yet
+
+                        # Extract and queue the sentence
+                        sentence = accumulated_text[processed_up_to:sentence_end + 1].strip()
+                        if sentence:
+                            # First, remove complete image prompts with brackets
+                            cleaned_sentence = re.sub(r'\[CREATE_IMAGE:.*?\]', '', sentence).strip()
+                            
+                            # Check for any "CREATE_IMAGE:" text with or without brackets
+                            if 'CREATE_IMAGE:' in cleaned_sentence:
+                                # Cut off everything from CREATE_IMAGE: to the end, regardless of brackets
+                                cleaned_sentence = cleaned_sentence.split('CREATE_IMAGE:')[0].strip()
+                                
+                            if cleaned_sentence:  # Only queue if there's content after cleaning
+                                sentence = cleaned_sentence
+                                tts_queue.put(cleaned_sentence)
+                            sentence = cleaned_sentence
+                        processed_up_to = sentence_end + 1
+
+                    # Update UI with regular text
+                    self._update_last_message(accumulated_text)
+
+        # Define completion handler
+        def on_llm_complete():
+
+            
+            
+            nonlocal accumulated_text, processed_up_to, thinking_buffer, in_thinking_mode
+            
+            # If we were in thinking mode and have buffer left, create a final summary
+            if in_thinking_mode and len(thinking_buffer) < 200:
+
+                summary = self._create_thinking_summary(thinking_buffer, is_final=True)
+                if summary:
+                    # Queue the final thinking summary with highest priority
+                    self._speak_thinking_summary(summary, True)
+                    
+                    # Signal the end of thinking summaries
+                    self.thinking_tts_queue.put(None)
+            else:
+                # If we weren't in thinking mode, make sure any thinking TTS is stopped
+                self.stop_thinking_tts()
+            
+            # Add any remaining text to the queue
+            if processed_up_to < len(accumulated_text):
+                remaining_text = accumulated_text[processed_up_to:].strip()
+                if remaining_text:
+                    tts_queue.put(remaining_text)
+            
+            # Signal the TTS worker to stop
+            tts_queue.put(None)
+
+            # Check for image generation requests
+            if "[CREATE_IMAGE:" in accumulated_text:
+                try:
+                    image_start = accumulated_text.find("[CREATE_IMAGE:")
+                    image_end = accumulated_text.find("]", image_start)
+                    if image_end > image_start:
+                        image_prompt = accumulated_text[image_start + 14:image_end].strip()
+
+                        # Clean the response for display
+                        cleaned_response = accumulated_text[:image_start].rstrip()
+                        self._update_last_message(cleaned_response)
+
+                        # Mark image as processed and generate it
+                        self.last_image_processed = image_prompt
+                        self.display_generated_image(image_prompt)
+                except Exception as e:
+                    logging.error(f"Error extracting image prompt: {e}")
+
+        # Call the streaming function with LLM parameters
+        stream_params = {
+            "api_key": openrouter_api_key,
+            "data": data
+        }
+
+        self.stream_api_response("llm", stream_params, process_llm_chunk, on_llm_complete)
+
+        # Construct a response object
+        response_obj = {
+            "choices": [
+                {
+                    "message": {
+                        "content": accumulated_text,
+                        "role": "assistant",
+                        "reasoning": None  # Add reasoning if needed
+                    }
+                }
+            ]
+        }
+
+        return response_obj
+
+    def stream_api_response(self, api_type, request_params, on_chunk_received, on_complete=None):
+        """
+        Generic streaming handler that works with both LLM and TTS APIs.
+        
+        Args:
+            api_type: String, either "llm" or "tts"
+            request_params: Dictionary containing API-specific parameters
+            on_chunk_received: Callback function to process each chunk
+            on_complete: Optional callback when streaming completes
+        """
+        self.update_status(f"Starting {api_type} streaming...")
+        print(f"stream_api_response: Starting {api_type} streaming...")
+        self.current_tts_stream_completed = False
+        try:
+            if api_type == "llm":
+                # Extract LLM request parameters
+                openrouter_api_url = self.config_data.get('OPENROUTER_API_URL', 'https://openrouter.ai/api/v1/chat/completions')
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {request_params["api_key"]}',
+                    'X-Title': 'Chat Audio Generator'
+                }
+                
+                # Start LLM streaming
+                with requests.post(openrouter_api_url, headers=headers, json=request_params["data"], stream=True) as response:
+                    response.raise_for_status()
+                    self.update_status("Receiving streaming response...")
+                    print("stream_api_response: Receiving streaming response...")
+                    buffer = ""
+                    response.encoding = 'utf-8'
+                    for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):
+                        if chunk:
+                            buffer += chunk
+                            
+                            # Process complete SSE lines
+                            while True:
+                                line_end = buffer.find('\n')
+                                if line_end == -1:
+                                    break
+                                    
+                                line = buffer[:line_end].strip()
+                                buffer = buffer[line_end + 1:]
+                                
+                                if line.startswith('data: '):
+                                    data = line[6:]
+                                    if data == '[DONE]':
+                                        break
+                                        
+                                    try:
+                                        data_obj = json.loads(data)
+                                        on_chunk_received(data_obj)
+                                        print("stream_api_response: data_obj received")
+                                    except json.JSONDecodeError:
+                                        pass
+                    
+                self.update_status(f"{api_type.upper()} streaming completed")
+                print(f"stream_api_response: {api_type.upper()} streaming completed")
+                
+            elif api_type == "tts":
+                print("stream_api_response: Entering TTS streaming block")
+                client = OpenAI(api_key=request_params["api_key"])
+                text = request_params["text"]
+
+                if re.match(r'^[Nn][Oo][.!,]?$', text.strip()):
+                    print(f"stream_api_response: Skipping TTS for simple 'No' response: '{text}'")
+                    # Call on_complete callback if provided
+                    if on_complete:
+                        on_complete()
+                    return
+                                    
+                print(f"stream_api_response: Text to be spoken: {text}")
+                device_id = request_params.get("device_id")
+                estimated_duration = len(text.split()) / 2  # Estimate: 2 words per second
+                
+                # Start progress bar
+                self.after(0, lambda: self.start_progress_bar(estimated_duration))
+                print(f"stream_api_response: Progress bar started with estimated duration: {estimated_duration}")
+                
+                try:
+                    with client.audio.speech.with_streaming_response.create(
+                            model="tts-1",
+                            voice=self.config_data.get('TTS_VOICE', 'alloy'),  # Use selected voice with fallback
+                            input=text,
+                            response_format='wav'
+                    ) as response:
+                        audio_buffer = bytearray()
+                        stream = None
+                        
+                        # Set up audio playback queue and processing
+                        audio_queue = queue.Queue()
+                        playback_done = threading.Event()
+                        playback_thread = threading.Thread(
+                            target=self._process_tts_audio_queue, 
+                            args=(audio_queue, playback_done, device_id),
+                            daemon=True
+                        )
+                        playback_thread.start()
+                        
+                        # Stream chunks to the audio queue
+                        first_chunk = True
+                        for data_chunk in response.iter_bytes(chunk_size=4096):
+                            audio_queue.put(data_chunk)
+                            
+                            # Update progress based on data received
+                            progress_percent = min(90, len(data_chunk) / (estimated_duration * 16000))
+                            self.after(0, lambda p=progress_percent: self.update_progress_bar(p))
+                            
+                            # Let the callback process each chunk if needed
+                            on_chunk_received(data_chunk, first_chunk)
+                            first_chunk = False
+
+                            #print(f"stream_api_response: Data chunk received")
+                        
+                        # Signal completion and wait for playback to finish
+                        playback_done.set()
+                        playback_thread.join()
+
+
+                except Exception as e:  # Catch *ALL* exceptions here
+                    error_msg = f"Error in TTS streaming: {e}"
+                    print(f"stream_api_response: error_msg")
+                    logging.error(error_msg)
+                    self.after(0, lambda: self.append_message(error_msg, sender='system'))
+                    self.after(0, lambda: self.update_status(f"Error during TTS"))
+                    
+                # Complete the progress bar
+                self.progress_bar['value'] = self.progress_bar['maximum']
+                print("stream_api_response: Progress bar completed")
+                self.update_status("TTS streaming completed")
+                self.current_tts_stream_completed = True
+                
+            # Call on_complete callback if provided
+            if on_complete:
+                print("stream_api_response: Calling on_complete callback")
+                on_complete()
+                
+        except Exception as e:
+            error_msg = f"Error in {api_type} streaming: {e}"
+            print(f"stream_api_response: {error_msg}")
+            logging.error(error_msg)
+            self.after(0, lambda: self.append_message(error_msg, sender='system'))
+            self.after(0, lambda: self.update_status(f"Error during {api_type}"))
+            return None
+
+    def _create_thinking_summary(self, thinking_text, is_final=False):
+        """
+        Create a summary of the thinking process text.
+        
+        Args:
+            thinking_text (str): The thinking process text to summarize
+            is_final (bool): Whether this is the final summary
+            
+        Returns:
+            str: A summarized version of the thinking text
+        """
+        
+        # For longer thinking, extract a single meaningful complete sentence
+        # Split into sentences ensuring we get complete ones
+        sentences = re.split(r'(?<=[.!?])\s+', thinking_text)
+        
+        # Make sure we have valid sentences
+        valid_sentences = [s for s in sentences if len(s) > 10 and s.strip().endswith(('.', '!', '?'))]
+        if not valid_sentences:
+            return None
+        
+        if is_final:
+            return f"My final thought: {valid_sentences[-1]}"
+        
+        selected = valid_sentences[-1]
+        return selected
+
+    def reset_conversation(self):
+        global messages
+        messages = []
+        self.append_message("Conversation has been reset. You can start a new conversation.", sender="system")
+
+    def _update_last_message(self, text):
+        """Update the last message in the chat UI with new content"""
+        if hasattr(self, "last_message_frame") and self.last_message_frame:
+            # Find the bubble (Label) widget in the last message frame
+            for child in self.last_message_frame.winfo_children():
+                if isinstance(child, tk.Label) and child.cget("bg") == "#FFFFFF":  # Assistant message background
+                    # Ensure proper encoding for Finnish characters
+                    try:
+                        # Special formatting for reasoning/thinking text
+                        if text.startswith("🤔") or text.startswith("🧠"):
+                            child.config(
+                                text=text,
+                                fg="#555555",  # Darker gray text for thinking
+                                font=("Arial", 10, "italic")  # Italic font for thinking
+                            )
+                        else:
+                            # Normal text for regular responses
+                            child.config(
+                                text=text,
+                                fg="black",
+                                font=("Arial", 10)
+                            )
+                    except Exception as e:
+                        logging.error(f"Error updating text with special characters: {e}")
+                        # Fallback method if there are encoding issues
+                        try:
+                            sanitized_text = text.encode('utf-8', errors='replace').decode('utf-8')
+                            child.config(text=sanitized_text)
+                        except:
+                            # Last resort fallback
+                            child.config(text="[Text encoding error]")
+                    
+                    # Update the canvas to show changes
+                    self.chat_canvas.update_idletasks()
+                    self.chat_canvas.yview_moveto(1.0)
+                    break
+
+    def process_transcription(self, transcript, client, openrouter_api_key, selected_model):
+        """Process transcribed text and determine appropriate action based on content."""
+        try:
+            # Display user's message in the chat
+            self.append_message(transcript, sender="user")
+            
+            # Some preprocessing of user input
+            user_input = self._add_pdf_content_if_exists(transcript)
+            
+            # Get image path if needed
+            image_path = None
+            if self.send_image_var.get():
+                image_path = select_latest_image()
+            
+            # Get current game mode
+            current_game = self.game_var.get()
+            
+            # Process based on the current context/mode
+            if "generate music" in user_input.lower() or "create song" in user_input.lower():
+                self._handle_music_generation(user_input)
+            elif current_game == "Chess" and self.chess_board and not self.chess_game_ended:
+                self._handle_chess_input(user_input, selected_language=self.map_language_to_code(self.language_var.get()), 
+                                        openrouter_api_key=openrouter_api_key, 
+                                        selected_model=selected_model, 
+                                        image_path=image_path)
+            else:
+                self._handle_normal_chat(user_input, selected_language=self.map_language_to_code(self.language_var.get()), 
+                                        openrouter_api_key=openrouter_api_key, 
+                                        selected_model=selected_model, 
+                                        image_path=image_path)
+        except Exception as e:
+            error_msg = f"Error processing transcription: {str(e)}"
+            logging.error(error_msg)
+            self.handle_error(error_msg)
+
+    def _add_pdf_content_if_exists(self, user_input):
+        """Check for and add PDF content if available"""
+        text_file_path = Path(r"C:\\Users\\ronit\\OneDrive\\Tiedostot\\extracted_pdf_data\\text\\full_text.txt")
+        if text_file_path.exists():
+            try:
+                extracted_content = text_file_path.read_text(encoding='utf-8')
+                user_input += f"\n\n[Extracted PDF Content]\n{extracted_content}"
+                text_file_path.unlink()  # Delete the file
+                self.append_message("Added extracted PDF content to the message.", sender="system")
+            except Exception as e:
+                self.append_message(f"Error processing text file: {e}", sender="system")
+        return user_input
+
+    def _handle_normal_chat(self, user_input, selected_language, openrouter_api_key, selected_model, image_path):
+        """Process input in normal chat mode"""
+        global messages
+        
+        # Add user message to conversation history
+        messages.append({"role": "user", "content": user_input})
+
+        self.update_status("Having a conversation...")
+
+        # Add placeholder message before streaming begins
+        self.append_message("Thinking about your message...", sender="assistant")
+        
+        # Send to LLM and process response
+        self._process_llm_response(
+            messages, 
+            image_path, 
+            selected_language, 
+            openrouter_api_key, 
+            selected_model
         )
-        self.chess_canvas.pack()
-        self.chess_canvas.bind("<Button-1>", self.on_chess_canvas_click)
 
-        # Controls panel below the chess board
-        controls_frame = tk.Frame(self.chess_frame)
-        controls_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+    def _process_llm_response(self, message_list, image_path, selected_language, openrouter_api_key, selected_model):
+        """Send messages to LLM and process the response"""
+        global messages
 
-        # Left column: buttons
-        left_controls = tk.Frame(controls_frame)
-        left_controls.grid(row=0, column=0, sticky="w", padx=(0, 20))
-
-        self.ai_move_button = tk.Button(
-            left_controls,
-            text="Ask AI for a Move",
-            command=self.retry_ai_move,
-            width=15,
-            state=tk.NORMAL,
+        # Get reasoning settings from UI
+        reasoning_effort = self.reasoning_effort_var.get()
+        show_reasoning = self.show_reasoning_var.get()
+        
+        # Pass to OpenRouter function
+        response_json = self.send_message(
+            message_list,
+            image_path=image_path,
+            language=selected_language,
+            openrouter_api_key=openrouter_api_key,
+            model=selected_model,
+            reasoning_effort=reasoning_effort,
+            show_reasoning=show_reasoning
         )
-        self.ai_move_button.pack(side=tk.TOP, pady=5)
+        
+        if not response_json:
+            return
+            
+        try:
+            assistant_response = response_json['choices'][0]['message']['content']
+            logging.info(f"Assistant: {assistant_response}")
+            
+            # Check if image was already processed during streaming
+            already_processed = hasattr(self, 'last_image_processed')
+            
+            # Check for image generation instructions only if not already processed
+            if not already_processed:
+                prompt_for_image = None
+                pattern = r"\[CREATE_IMAGE:\s*(.*?)\]"
+                match = re.search(pattern, assistant_response)
+                
+                if match:
+                    prompt_for_image = match.group(1).strip()
+                    cleaned_response = re.sub(pattern, '', assistant_response).strip()
+                    self.display_generated_image(prompt_for_image)
+                    
+                    # If response only contained image prompt
+                    if not cleaned_response:
+                        return
+                else:
+                    cleaned_response = assistant_response
+            else:
+                # Image already processed, just clean the response
+                pattern = r"\[CREATE_IMAGE:\s*(.*?)\]"
+                cleaned_response = re.sub(pattern, '', assistant_response).strip()
+                # Reset the flag
+                delattr(self, 'last_image_processed')
+            
+            # update conversation history
+            messages.append({"role": "assistant", "content": assistant_response})
+         
+            
+        except (IndexError, KeyError) as e:
+            logging.error(f"Unexpected response format: {e}")
+            self.handle_error(f"Unexpected response format from LLM: {e}")
 
-        self.reset_game_button = tk.Button(
-            left_controls,
-            text="Reset game",
-            command=self.reset_chess_game,
-            width=15,
-            bg="#FF5733",
-            fg="white"
-        )
-        self.reset_game_button.pack(side=tk.TOP, pady=5)
-
-        # Right column: checkboxes
-        right_controls = tk.Frame(controls_frame)
-        right_controls.grid(row=0, column=1, sticky="e")
-
-        self.ai_only_valid_moves_check = tk.Checkbutton(
-            right_controls,
-            text=("Include a list of legal moves\nwith your move\n"
-                "this will be sent to the AI\nDisable this for more interesting gameplay."),
-            justify=tk.LEFT,
-            variable=self.show_ai_only_valid_moves_var,
-            command=self.update_ai_only_valid_moves
-        )
-        self.ai_only_valid_moves_check.pack(side=tk.TOP, pady=5)
-
-        self.include_explanation_var = tk.BooleanVar(value=True)
-        self.include_explanation_check = tk.Checkbutton(
-            right_controls,
-            text=("Ask AI to include verbal explanation\nfor the move and speak the explanation out loud"),
-            justify=tk.LEFT,
-            variable=self.include_explanation_var
-        )
-        self.include_explanation_check.pack(side=tk.TOP, pady=5)
+    #----------------------------Chess Game Functions----------------------------
 
     def show_chess_ui(self):
         self.chess_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
@@ -1696,7 +3744,7 @@ class ChatAudioApp5(tk.Tk):
     def hide_chess_ui(self):
         if self.chess_frame is not None:
             self.chess_frame.pack_forget()
-            
+
     def load_chess_images(self):
         piece_names = {
             'K': 'King',
@@ -2007,7 +4055,7 @@ class ChatAudioApp5(tk.Tk):
                 self.after(0, lambda: self._process_chess_ai_response(assistant_response))
             except (IndexError, KeyError) as e:
                 self.after(0, lambda: self.handle_error(f"Error processing AI response: {e}"))
-                
+
     def _process_chess_ai_response(self, assistant_response):
         """Process the AI's response in the main thread"""
         global messages
@@ -2111,7 +4159,6 @@ class ChatAudioApp5(tk.Tk):
             except (IndexError, KeyError) as e:
                 self.after(0, lambda: self.handle_error(f"Error processing AI response: {e}"))
 
-    
     def save_chess_game_state(self):
         """Save the current chess game state to a file."""
         if not self.chess_board or self.chess_game_ended:
@@ -2132,7 +4179,7 @@ class ChatAudioApp5(tk.Tk):
                 json.dump(game_state, f, indent=2)
         except Exception as e:
             logging.error(f"Failed to save chess game state: {e}")
-    
+
     def load_chess_game_state(self):
         """Load a previously saved chess game if it exists."""
         if not os.path.exists(CHESS_SAVE_FILE):
@@ -2174,1460 +4221,6 @@ class ChatAudioApp5(tk.Tk):
             self.show_chess_ui()
         else:
             self.hide_chess_ui()
-
-    def get_device_sample_rate(self, device_id):
-        """Query the default sample rate for the given device (input)."""
-        try:
-            device_info = sd.query_devices(device_id, 'input')
-            return int(device_info['default_samplerate'])
-        except Exception as e:
-            logging.error(f"Could not retrieve sample rate for device {device_id}: {e}")
-            return 44100
-
-    def get_device_input_channels(self, device_id):
-        """Return max input channels for the selected device or 1 if error."""
-        try:
-            device_info = sd.query_devices(device_id, 'input')
-            return device_info['max_input_channels']
-        except Exception as e:
-            logging.error(f"Could not retrieve channels for device {device_id}: {e}")
-            return 1
-
-    def reset_conversation(self):
-        if messagebox.askyesno("Confirm Reset", "Are you sure you want to reset LLM conversation memory?"):
-            global messages
-            messages = []
-
-    def clear_chat(self):
-        """
-        Tyhjentää kaikki viestit chat-ikkunasta, mutta säilyttää keskusteluhistorian.
-        """
-        for widget in self.chat_inner_frame.winfo_children():
-            widget.destroy()
-        
-        # Reset any references to message frames
-        self.last_message_frame = None
-        
-        # Use after() to ensure widgets are fully destroyed before adding new message
-        self.after(100, lambda: self.append_message("The chat has been cleared. You can start a new conversation.", sender="system"))
-        
-        # Scroll to top after widgets are updated
-        self.after(200, lambda: self.chat_canvas.yview_moveto(0))
-
-
-    def update_status(self, status):
-        self.after(0, self._update_status, status)
-
-    def _update_status(self, status):
-        self.status_label.config(text=status)
-        if status in ["Idle", "Listening...", "Speaking completed"]:
-            self.status_label.config(fg="green")
-        elif status.startswith("Error"):
-            self.status_label.config(fg="red")
-        else:
-            self.status_label.config(fg="blue")
-
-    def append_message(self, text, sender="system"):
-        self.after(0, self._append_message, text, sender)
-
-    def _append_message(self, text, sender):
-        """
-        Display messages in the chat area with different styling for system/user/assistant.
-        Consecutive system messages are grouped under a single collapsible indicator.
-        """
-        # Store all messages in chat history regardless of visibility
-        timestamp = datetime.now().strftime('%H:%M')
-        self.chat_history.append({"text": text, "sender": sender, "timestamp": timestamp})
-        
-        # Check if this is a system message that should be grouped
-        if sender == "system":
-            # Get the last frame that was added (if any)
-            last_frame = None
-            if hasattr(self, "last_message_frame") and self.last_message_frame:
-                last_frame = self.last_message_frame
-                
-            # Check if the last frame was a system message group
-            if last_frame and hasattr(last_frame, "is_system_group") and last_frame.is_system_group:
-                # Add this message to the existing group
-                content_frame = last_frame.content_frame
-                
-                # Add a separator if there are already messages
-                if content_frame.winfo_children():
-                    separator = tk.Frame(content_frame, height=1, bg="#DDDDDD")
-                    separator.pack(fill=tk.X, pady=2)
-                
-                # Add the new message
-                msg_bubble = tk.Label(
-                    content_frame,
-                    text=text,
-                    bg="#FFCCCB",
-                    fg="black",
-                    padx=10,
-                    pady=5,
-                    wraplength=400,
-                    justify="left",
-                    relief="groove",
-                    borderwidth=1
-                )
-                msg_bubble.pack(fill=tk.X, anchor="w")
-                
-                # Add timestamp
-                time_label = tk.Label(
-                    content_frame,
-                    text=timestamp,
-                    bg="#ECE5DD",
-                    fg="gray",
-                    font=("Arial", 8)
-                )
-                time_label.pack(anchor="w")
-                
-                # Update the message count in the indicator
-                last_frame.message_count += 1
-                last_frame.indicator.config(text=f"➕ {last_frame.message_count} System Messages")
-                
-                # Update scroll
-                self.chat_canvas.update_idletasks()
-                self.chat_canvas.yview_moveto(1.0)
-                return
-        
-        # If we reached here, we're either:
-        # 1. Not a system message
-        # 2. First system message in a new group
-        
-        # Create a new message frame
-        if sender == "user":
-            bg_color = "#DCF8C6"
-            anchor = "e"
-            fg_color = "black"
-        elif sender == "assistant":
-            bg_color = "#FFFFFF"
-            anchor = "w"
-            fg_color = "black"
-        else:  # system messages
-            bg_color = "#FFCCCB"
-            anchor = "w"
-            fg_color = "black"
-        
-        msg_frame = tk.Frame(self.chat_inner_frame, bg="#ECE5DD", padx=10, pady=5)
-        msg_frame.pack(fill=tk.BOTH, expand=True, anchor=anchor)
-        self.last_message_frame = msg_frame
-        
-        # For system messages, create a collapsible group
-        if sender == "system":
-            # Mark this frame as a system group
-            msg_frame.is_system_group = True
-            msg_frame.message_count = 1
-            
-            # Create a collapsed indicator
-            collapsed_frame = tk.Frame(msg_frame, bg="#ECE5DD")
-            collapsed_frame.pack(fill=tk.X, anchor="w")
-            
-            indicator = tk.Label(
-                collapsed_frame,
-                text="➕ 1 System Message",
-                bg="#FFCCCB",
-                fg="black",
-                padx=5,
-                pady=2,
-                relief="groove",
-                borderwidth=1,
-                cursor="hand2"
-            )
-            indicator.pack(side=tk.LEFT, anchor="w")
-            msg_frame.indicator = indicator
-            
-            # Create content frame (initially hidden)
-            content_frame = tk.Frame(msg_frame, bg="#ECE5DD")
-            msg_frame.content_frame = content_frame
-            
-            # Add the message to the content frame
-            msg_bubble = tk.Label(
-                content_frame,
-                text=text,
-                bg=bg_color,
-                fg=fg_color,
-                padx=10,
-                pady=5,
-                wraplength=400,
-                justify="left",
-                relief="groove",
-                borderwidth=1
-            )
-            msg_bubble.pack(fill=tk.X, anchor=anchor)
-            
-            # Add timestamp
-            time_label = tk.Label(
-                content_frame,
-                text=timestamp,
-                bg="#ECE5DD",
-                fg="gray",
-                font=("Arial", 8)
-            )
-            time_label.pack(anchor=anchor)
-            
-            # Toggle function for this group
-            def toggle_system_group(event):
-                if content_frame.winfo_ismapped():
-                    content_frame.pack_forget()
-                    indicator.config(text=f"➕ {msg_frame.message_count} System Message{'s' if msg_frame.message_count > 1 else ''}")
-                else:
-                    content_frame.pack(fill=tk.X, anchor="w", pady=(5, 0))
-                    indicator.config(text=f"➖ {msg_frame.message_count} System Message{'s' if msg_frame.message_count > 1 else ''}")
-            
-            # Bind click event to the indicator
-            indicator.bind("<Button-1>", toggle_system_group)
-            
-        else:  # Regular user/assistant messages
-            bubble = tk.Label(
-                msg_frame,
-                text=text,
-                bg=bg_color,
-                fg=fg_color,
-                padx=10,
-                pady=5,
-                wraplength=400,
-                justify="left",
-                relief="groove",
-                borderwidth=1
-            )
-            bubble.pack(anchor=anchor)
-
-            time_label = tk.Label(
-                msg_frame,
-                text=timestamp,
-                bg="#ECE5DD",
-                fg="gray",
-                font=("Arial", 8)
-            )
-            time_label.pack(anchor=anchor)
-
-        self.chat_canvas.update_idletasks()
-        self.chat_canvas.yview_moveto(1.0)
-
-    def append_image_in_chat(self, image_path, sender="user"):
-        self.after(0, self._append_image_in_chat, image_path, sender)
-
-    def _append_image_in_chat(self, image_path, sender):
-        """
-        Display an image in the chat area, using a label widget with a PhotoImage.
-        """
-        import os
-
-        if not os.path.exists(image_path):
-            self.append_message(f"Image not found: {image_path}", sender="system")
-            return
-
-        if sender == "user":
-            bg_color = "#DCF8C6"
-            anchor = "e"
-        elif sender == "assistant":
-            bg_color = "#FFFFFF"
-            anchor = "w"
-        else:
-            bg_color = "#FFCCCB"
-            anchor = "w"
-
-        try:
-            img = Image.open(image_path)
-            max_width = 300
-            if img.width > max_width:
-                wpercent = (max_width / float(img.width))
-                hsize = int(float(img.height) * float(wpercent))
-                img = img.resize((max_width, hsize), Image.Resampling.LANCZOS)
-
-            photo = ImageTk.PhotoImage(img)
-        except Exception as e:
-            self.append_message(f"Failed to load image: {e}", sender="system")
-            return
-
-        msg_frame = tk.Frame(self.chat_inner_frame, bg="#ECE5DD", padx=10, pady=5)
-        msg_frame.pack(fill=tk.BOTH, expand=True, anchor=anchor)
-
-        bubble = tk.Label(
-            msg_frame,
-            bg=bg_color,
-            image=photo,
-            padx=5,
-            pady=5,
-            relief="groove",
-            borderwidth=1
-        )
-        bubble.image = photo
-        bubble.pack(anchor=anchor)
-
-        timestamp = datetime.now().strftime('%H:%M')
-        time_label = tk.Label(
-            msg_frame,
-            text=timestamp,
-            bg="#ECE5DD",
-            fg="gray",
-            font=("Arial", 8)
-        )
-        time_label.pack(anchor=anchor)
-
-        self.chat_canvas.update_idletasks()
-        self.chat_canvas.yview_moveto(1.0)
-
-
-    #_____________Scrollaus hiirellä________________________
-
-    def on_tab_changed(self, event):
-        """
-        Tätä kutsutaan, kun Notebookin välilehti vaihtuu.
-        Päivitetään active_canvas oikeaksi.
-        """
-        selected_tab = self.notebook.select()  # Hanki ID:n valitulle tabille.
-
-        if selected_tab == str(self.main_tab):
-            self.active_canvas = self.chat_canvas
-        elif selected_tab == str(self.settings_tab):
-            self.active_canvas = self.settings_canvas
-        # Voit lisätä ehtoja, jos sinulla on enemmän tabeja.
-
-        # Varmistetaan, että vieritysalue päivittyy uuden canvaksen koon mukaan
-        if self.active_canvas == self.settings_canvas:
-            self.on_frame_configure(None)
-
-    def bind_mousewheel(self):
-        system = platform.system()
-        if system == 'Windows':
-            self.bind_all("<MouseWheel>", self.on_mousewheel_windows)
-        elif system == 'Darwin':
-            self.bind_all("<MouseWheel>", self.on_mousewheel_mac)
-        else:
-            self.bind_all("<Button-4>", self.on_mousewheel_linux)
-            self.bind_all("<Button-5>", self.on_mousewheel_linux)
-
-    def on_mousewheel_windows(self, event):
-        # Käytä self.active_canvas-muuttujaa!
-        self.active_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def on_mousewheel_mac(self, event):
-        # Käytä self.active_canvas-muuttujaa!
-        self.active_canvas.yview_scroll(int(-1 * (event.delta)), "units")
-
-    def on_mousewheel_linux(self, event):
-        # Käytä self.active_canvas-muuttujaa!
-        if event.num == 4:
-            self.active_canvas.yview_scroll(-1, "units")
-        elif event.num == 5:
-            self.active_canvas.yview_scroll(1, "units")
-
-
-    #_______________________________________________________________________________________________________________
-
-    def on_closing(self):
-        if messagebox.askokcancel("Quit", "Do you want to quit?"):
-            try:
-                self.update_status("Shutting down...")
-                
-                # Save chess game state
-                self.save_chess_game_state()
-                
-                # Stop all streaming and processing
-                self.stream_stop_event.set()
-                
-                # Stop audio streams
-                if self.stream1:
-                    self.stream1.stop()
-                    self.stream1.close()
-                    self.stream1 = None
-                
-                if self.stream2:
-                    self.stream2.stop()
-                    self.stream2.close()
-                    self.stream2 = None
-                
-                # Clean up all threads
-                self.cleanup_threads()
-                
-                # Final cleanup
-                self.destroy()
-                sys.exit(0)
-            except Exception as e:
-                logging.error(f"Error during exit: {e}")
-                self.destroy()
-                sys.exit(1)
-
-    def get_vol_threshold(self):
-        try:
-            return float(self.vol_threshold_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Volume Threshold must be a number.")
-            return DEFAULT_VOL_THRESHOLD
-
-    def get_min_record_duration(self):
-        try:
-            return float(self.min_record_duration_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Minimum Record Duration must be a number.")
-            return DEFAULT_MIN_RECORD_DURATION
-
-    def get_max_silence_duration(self):
-        try:
-            return float(self.max_silence_duration_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Maximum Silence Duration must be a number.")
-            return DEFAULT_MAX_SILENCE_DURATION
-
-    def handle_error(self, error_message):
-        user_message = f"An error occurred: {error_message}. Restarting the conversation."
-        self.append_message(user_message, sender="system")
-        self.update_status("Error encountered")
-        self.reset_conversation()
-
-
-    def stream_api_response(self, api_type, request_params, on_chunk_received, on_complete=None):
-        """
-        Generic streaming handler that works with both LLM and TTS APIs.
-        
-        Args:
-            api_type: String, either "llm" or "tts"
-            request_params: Dictionary containing API-specific parameters
-            on_chunk_received: Callback function to process each chunk
-            on_complete: Optional callback when streaming completes
-        """
-        self.update_status(f"Starting {api_type} streaming...")
-        print(f"stream_api_response: Starting {api_type} streaming...")
-        self.current_tts_stream_completed = False
-        try:
-            if api_type == "llm":
-                # Extract LLM request parameters
-                openrouter_api_url = self.config_data.get('OPENROUTER_API_URL', 'https://openrouter.ai/api/v1/chat/completions')
-                headers = {
-                    'Content-Type': 'application/json',
-                    'Authorization': f'Bearer {request_params["api_key"]}',
-                    'X-Title': 'Chat Audio Generator'
-                }
-                
-                # Start LLM streaming
-                with requests.post(openrouter_api_url, headers=headers, json=request_params["data"], stream=True) as response:
-                    response.raise_for_status()
-                    self.update_status("Receiving streaming response...")
-                    print("stream_api_response: Receiving streaming response...")
-                    buffer = ""
-                    response.encoding = 'utf-8'
-                    for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):
-                        if chunk:
-                            buffer += chunk
-                            
-                            # Process complete SSE lines
-                            while True:
-                                line_end = buffer.find('\n')
-                                if line_end == -1:
-                                    break
-                                    
-                                line = buffer[:line_end].strip()
-                                buffer = buffer[line_end + 1:]
-                                
-                                if line.startswith('data: '):
-                                    data = line[6:]
-                                    if data == '[DONE]':
-                                        break
-                                        
-                                    try:
-                                        data_obj = json.loads(data)
-                                        on_chunk_received(data_obj)
-                                        print("stream_api_response: data_obj received")
-                                    except json.JSONDecodeError:
-                                        pass
-                    
-                self.update_status(f"{api_type.upper()} streaming completed")
-                print(f"stream_api_response: {api_type.upper()} streaming completed")
-                
-            elif api_type == "tts":
-                print("stream_api_response: Entering TTS streaming block")
-                client = OpenAI(api_key=request_params["api_key"])
-                text = request_params["text"]
-
-                if re.match(r'^[Nn][Oo][.!,]?$', text.strip()):
-                    print(f"stream_api_response: Skipping TTS for simple 'No' response: '{text}'")
-                    # Call on_complete callback if provided
-                    if on_complete:
-                        on_complete()
-                    return
-                                    
-                print(f"stream_api_response: Text to be spoken: {text}")
-                device_id = request_params.get("device_id")
-                estimated_duration = len(text.split()) / 2  # Estimate: 2 words per second
-                
-                # Start progress bar
-                self.after(0, lambda: self.start_progress_bar(estimated_duration))
-                print(f"stream_api_response: Progress bar started with estimated duration: {estimated_duration}")
-                
-                try:
-                    with client.audio.speech.with_streaming_response.create(
-                            model="tts-1",
-                            voice=self.config_data.get('TTS_VOICE', 'alloy'),  # Use selected voice with fallback
-                            input=text,
-                            response_format='wav'
-                    ) as response:
-                        audio_buffer = bytearray()
-                        stream = None
-                        
-                        # Set up audio playback queue and processing
-                        audio_queue = queue.Queue()
-                        playback_done = threading.Event()
-                        playback_thread = threading.Thread(
-                            target=self._process_tts_audio_queue, 
-                            args=(audio_queue, playback_done, device_id),
-                            daemon=True
-                        )
-                        playback_thread.start()
-                        
-                        # Stream chunks to the audio queue
-                        first_chunk = True
-                        for data_chunk in response.iter_bytes(chunk_size=4096):
-                            audio_queue.put(data_chunk)
-                            
-                            # Update progress based on data received
-                            progress_percent = min(90, len(data_chunk) / (estimated_duration * 16000))
-                            self.after(0, lambda p=progress_percent: self.update_progress_bar(p))
-                            
-                            # Let the callback process each chunk if needed
-                            on_chunk_received(data_chunk, first_chunk)
-                            first_chunk = False
-
-                            #print(f"stream_api_response: Data chunk received")
-                        
-                        # Signal completion and wait for playback to finish
-                        playback_done.set()
-                        playback_thread.join()
-
-
-                except Exception as e:  # Catch *ALL* exceptions here
-                    error_msg = f"Error in TTS streaming: {e}"
-                    print(f"stream_api_response: error_msg")
-                    logging.error(error_msg)
-                    self.after(0, lambda: self.append_message(error_msg, sender='system'))
-                    self.after(0, lambda: self.update_status(f"Error during TTS"))
-                    
-                # Complete the progress bar
-                self.progress_bar['value'] = self.progress_bar['maximum']
-                print("stream_api_response: Progress bar completed")
-                self.update_status("TTS streaming completed")
-                self.current_tts_stream_completed = True
-                
-            # Call on_complete callback if provided
-            if on_complete:
-                print("stream_api_response: Calling on_complete callback")
-                on_complete()
-                
-        except Exception as e:
-            error_msg = f"Error in {api_type} streaming: {e}"
-            print(f"stream_api_response: {error_msg}")
-            logging.error(error_msg)
-            self.after(0, lambda: self.append_message(error_msg, sender='system'))
-            self.after(0, lambda: self.update_status(f"Error during {api_type}"))
-            return None
-
-    def _process_tts_audio_queue(self, audio_queue, playback_done, device_id):
-        """Process and play audio data from the queue"""
-
-
-        print("_process_tts_audio_queue: Started")
-        try:
-            stream = None
-            first_chunk = True
-            wav_header = None
-            
-            while not playback_done.is_set() or not audio_queue.empty():
-                try:
-                    audio_chunk = audio_queue.get(timeout=0.5)
-                    #print(f"_process_tts_audio_queue: Got chunk: {len(audio_chunk) if audio_chunk else None} bytes")
-                    
-                    if audio_chunk is not None:
-                        if first_chunk:
-                            # Extract WAV header info from first chunk
-                            with io.BytesIO(audio_chunk) as wav_io:
-                                wav = wave.open(wav_io, 'rb')
-                                channels = wav.getnchannels()
-                                sample_width = wav.getsampwidth()
-                                framerate = wav.getframerate()
-                                print(f"_process_tts_audio_queue: Channels: {channels}, Sample Width: {sample_width}, Framerate: {framerate}")
-                                
-                                # Create audio stream
-                                stream = sd.OutputStream(
-                                    samplerate=framerate,
-                                    channels=channels,
-                                    dtype=f'int{sample_width*8}',
-                                    device=device_id
-                                )
-                                print(f"_process_tts_audio_queue: Stream created: {stream}")
-                                stream.start()
-                                print(f"_process_tts_audio_queue: Stream started")
-                                
-                                # Process first chunk
-                                audio_data = np.frombuffer(
-                                    wav.readframes(wav.getnframes()),
-                                    dtype=np.int16
-                                )
-                                #print(f"_process_tts_audio_queue: Writing {len(audio_data)} samples to stream")
-                                stream.write(audio_data)
-                                first_chunk = False
-                        else:
-                            # Process subsequent chunks
-                            audio_data = np.frombuffer(audio_chunk, dtype=np.int16)
-                            #print(f"_process_tts_audio_queue: Writing {len(audio_data)} samples to stream")
-                            if stream is not None:
-                                stream.write(audio_data)
-                    
-                    audio_queue.task_done()
-                except queue.Empty:
-                    #print("_process_tts_audio_queue: Queue empty") # This can be noisy, so comment it out unless needed
-                    continue
-                except Exception as e:
-                    print(f"_process_tts_audio_queue: Error in playback: {e}") # CRITICAL: Print the exception
-                    logging.error(f"Error in audio playback: {e}")
-                    break
-            
-            if stream is not None:
-                print("_process_tts_audio_queue: Stopping stream")
-                stream.stop()
-                print("_process_tts_audio_queue: Closing stream")
-                stream.close()
-            print("_process_tts_audio_queue: Exiting")
-                    
-        except Exception as e:
-            logging.error(f"Audio playback thread error: {e}")
-            print(f"_process_tts_audio_queue: Outer exception: {e}")
-
-        finally:
-            print("_process_tts_audio_queue: Playback thread finished")
-                    
-
-    def send_message(self, messages, image_path=None, language='fi', openrouter_api_key='', model='default-model', reasoning_effort='medium', show_reasoning=True):
-        """
-        Unified function to send messages to either Ollama or OpenRouter, handling streaming and TTS.
-        """
-        if not hasattr(self, 'in_message_processing') or not self.in_message_processing:
-            self.saved_audio_state = self.audio_source_toggle_var.get()
-            self.in_message_processing = True
-            print(f"send_message: Saved audio state: {self.saved_audio_state}")
-
-        if model.startswith("ollama/"):
-            # Use Ollama
-            return self.send_message_to_ollama(messages, image_path, language, model, reasoning_effort, show_reasoning)
-        else:
-            # Use OpenRouter (existing logic)
-            return self.send_message_to_openrouter(messages, image_path, language, openrouter_api_key, model, reasoning_effort, show_reasoning)
-
-    def send_message_to_ollama(self, messages, image_path=None, language='fi', model='ollama/llama3', reasoning_effort='medium', show_reasoning=True):
-        """
-        Sends a message to an Ollama model, streams the response, and starts TTS playback.
-        """
-        try:
-            # Debug which Ollama model is being used
-            model_name = model.replace("ollama/", "", 1)
-            print(f"Using Ollama model: {model_name}")
-            
-            # Initialize the client
-            ollama_client = ollama.Client()
-            
-            # Create a queue for TTS sentences
-            tts_queue = queue.Queue()
-
-            # Start the TTS worker thread
-            tts_worker = threading.Thread(target=self._tts_worker, args=(tts_queue,), daemon=True)
-
-
-            tts_worker.start()
-
-            # Initialize variables for response tracking
-            accumulated_text = ""
-            processed_up_to = 0
-            thinking_buffer = ""
-            last_thinking_summary_time = time.time()
-            thinking_summary_interval = 3.0
-            in_thinking_mode = False
-            
-            # Add a placeholder message in the chat UI
-            self.append_message("Thinking...", sender="assistant")
-
-            # Define chunk handler for Ollama streaming
-            def process_ollama_chunk(chunk):
-                nonlocal accumulated_text, processed_up_to, thinking_buffer, last_thinking_summary_time, in_thinking_mode
-
-                # Ollama's response structure is different from OpenRouter.
-                if hasattr(chunk, 'message') and hasattr(chunk.message, 'content'):
-                    # New chat API format
-                    partial_content = chunk.message.content or ''
-                else:
-                    # Old generate API format
-                    partial_content = chunk.get('response', '') or ''
-                    
-                    # Debug the content received
-                    print(f"Ollama chunk received: {partial_content}")
-                    print(f"Raw chunk: {chunk}")
-                
-                if partial_content:
-                    # Check for thinking mode markers
-                    if "<think>" in partial_content and not in_thinking_mode:
-                        # Start of thinking mode
-                        in_thinking_mode = True
-                        # Start accumulated text with thinking emoji
-                        if not accumulated_text.startswith("🤔"):
-                            accumulated_text = "🤔 "
-                        thinking_buffer = ""  # Reset thinking buffer
-                    
-                    if in_thinking_mode:
-                        # Handle content in thinking mode
-                        if "</think>" in partial_content:
-                            # End of thinking mode
-                            in_thinking_mode = False
-                            
-                            # Split the content before and after </think>
-                            parts = partial_content.split("</think>", 1)
-                            
-                            # Add final part of thinking to buffer
-                            thinking_buffer += parts[0]
-                            
-                            # Create a final summary of the thinking
-                            if show_reasoning:
-                                summary = self._create_thinking_summary(thinking_buffer, is_final=True)
-                                if summary:
-                                    self._speak_thinking_summary(summary, True)
-                            
-                            # Reset accumulated text for the actual response
-                            accumulated_text = ""
-                            processed_up_to = 0
-                            
-                            # Process the part after </think> if it exists
-                            if len(parts) > 1 and parts[1].strip():
-                                accumulated_text += parts[1]
-                                self._update_last_message(accumulated_text)
-                        else:
-                            # Still in thinking mode
-                            thinking_buffer += partial_content
-                            
-                            if show_reasoning:
-                                # Add to accumulated text with thinking prefix
-                                accumulated_text += partial_content
-                                self._update_last_message(accumulated_text)
-                                
-                                # Check if it's time to create a thinking summary
-                                current_time = time.time()
-                                if current_time - last_thinking_summary_time > thinking_summary_interval and len(thinking_buffer) > 50:
-                                    # Create a summary of the thinking
-                                    summary = self._create_thinking_summary(thinking_buffer)
-                                    
-                                    # Speak the summary without showing it in chat
-                                    if summary:
-                                        # Use a separate thread to avoid blocking
-                                        summary_thread = threading.Thread(
-                                            target=self._speak_thinking_summary,
-                                            args=(summary,),
-                                            daemon=True
-                                        )
-                                        summary_thread.start()
-                                    
-                                    # Reset for next summary but keep some recent context
-                                    last_thinking_summary_time = current_time
-                    else:
-                        # Normal content (not in thinking mode)
-                        accumulated_text += partial_content
-                        
-                        # Make sure to update UI immediately
-                        self._update_last_message(accumulated_text)
-                        
-                        # Find complete sentences for TTS (same as in send_message_to_openrouter)
-                        while True:
-                            sentence_end = accumulated_text.find('.', processed_up_to)
-                            if sentence_end == -1:
-                                sentence_end = accumulated_text.find('!', processed_up_to)
-                            if sentence_end == -1:
-                                sentence_end = accumulated_text.find('?', processed_up_to)
-                            if sentence_end == -1:
-                                break  # No complete sentence yet
-                                
-                            # Extract and queue the sentence
-                            sentence = accumulated_text[processed_up_to:sentence_end + 1].strip()
-                            if sentence:
-                                # First, remove complete image prompts with brackets
-                                cleaned_sentence = re.sub(r'\[CREATE_IMAGE:.*?\]', '', sentence).strip()
-                                
-                                # Check for any "CREATE_IMAGE:" text with or without brackets
-                                if 'CREATE_IMAGE:' in cleaned_sentence:
-                                    # Cut off everything from CREATE_IMAGE: to the end, regardless of brackets
-                                    cleaned_sentence = cleaned_sentence.split('CREATE_IMAGE:')[0].strip()
-                                    
-                                if cleaned_sentence:  # Only queue if there's content after cleaning
-                                    sentence = cleaned_sentence
-                                    tts_queue.put(sentence)
-                                sentence = cleaned_sentence
-                            processed_up_to = sentence_end + 1
-            
-            # Define completion handler (Ollama-specific)
-            def on_ollama_complete():
-                nonlocal accumulated_text, processed_up_to, thinking_buffer, in_thinking_mode
-
-                # If we were in thinking mode and have buffer left, create a final summary
-                if in_thinking_mode and thinking_buffer:
-                    summary = self._create_thinking_summary(thinking_buffer, is_final=True)
-                    if summary and show_reasoning:
-                        # Queue the final thinking summary with highest priority
-                        self._speak_thinking_summary(summary, True)
-
-                        # Signal the end of thinking summaries
-                        self.thinking_tts_queue.put(None)
-                else:
-                    # If we weren't in thinking mode, make sure any thinking TTS is stopped
-                    self.stop_thinking_tts()
-
-                # Add any remaining text to the queue
-                if processed_up_to < len(accumulated_text):
-                    remaining_text = accumulated_text[processed_up_to:].strip()
-                    if remaining_text:
-                        tts_queue.put(remaining_text)
-                        
-                # Signal the TTS worker to stop
-                tts_queue.put(None)
-
-                # Check for image generation requests
-                if "[CREATE_IMAGE:" in accumulated_text:
-                    try:
-                        image_start = accumulated_text.find("[CREATE_IMAGE:")
-                        image_end = accumulated_text.find("]", image_start)
-                        if image_end > image_start:
-                            image_prompt = accumulated_text[image_start + 14:image_end].strip()
-
-                            # Clean the response for display
-                            cleaned_response = accumulated_text[:image_start].rstrip()
-                            self._update_last_message(cleaned_response)
-
-                            # Mark image as processed and generate it
-                            self.last_image_processed = image_prompt
-                            self.display_generated_image(image_prompt)
-                    except Exception as e:
-                        logging.error(f"Error extracting image prompt: {e}")
-
-            print(f"Sending conversation with {len(messages)} messages to Ollama") 
-            response_iter = ollama_client.chat(model=model_name, messages=messages, stream=True)
-
-            # Process each chunk as it comes in
-            for chunk in response_iter:
-                process_ollama_chunk(chunk)
-                
-            # Call completion handler when done
-            on_ollama_complete()
-            
-            # Return a response object similar to OpenRouter's format
-            # Clean up any thinking tags in the final response
-            final_text = accumulated_text
-            if "<think>" in final_text or "</think>" in final_text:
-                final_text = re.sub(r'<think>.*?</think>', '', final_text, flags=re.DOTALL).strip()
-            
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": final_text,
-                            "role": "assistant"
-                        }
-                    }
-                ]
-            }
-            
-        except Exception as e:
-            error_message = f"An unexpected error occurred with Ollama: {e}"
-            logging.error(error_message)
-            self.after(0, lambda: self.append_message(error_message, sender="system"))
-            return None
-
-    def send_message_to_openrouter(self, messages, image_path=None, language='fi', openrouter_api_key='', model='default-model', reasoning_effort='medium', show_reasoning=True):
-        """
-        Sends a message to the OpenRouter API, streams the LLM response, and starts TTS playback as sentences are completed.
-
-        Args:
-            messages (list): List of message dictionaries with 'role' and 'content'.
-            image_path (str, optional): Path to an image to include in the request.
-            language (str): Language code for the response (default: 'fi').
-            openrouter_api_key (str): API key for OpenRouter.
-            model (str): LLM model to use (default: 'default-model').
-            reasoning_effort (str): Level of reasoning effort ('low', 'medium', 'high').
-            show_reasoning (bool): Whether to include reasoning in the response.
-
-        Returns:
-            dict: Response object mimicking the non-streaming API response structure.
-        """
-
-
-        # Prepare personality prompt
-        base_personality_prompt = self.config_data.get('LLM_PERSONALITY', '')
-        current_game = self.game_var.get()
-
-        # Prepare game-specific personality prompt
-        if current_game != "Chess":
-            image_generation_instruction = (
-                "\nIf you feel like providing image or in case user says something like ...I would like to see an image of... "
-                "just include description of the image in English (ENGLISH!) on the last line of your reply like this: \n"
-                "[CREATE_IMAGE: <prompt text>]\n"
-                "(Make sure to include the square brackets as shown)."
-                "No math in latex format. Use simple math expressions like 2+2=4."
-            )
-            final_personality_prompt = base_personality_prompt + image_generation_instruction
-        else:
-            final_personality_prompt = base_personality_prompt
-
-        # Add system message if needed
-        game_changed = hasattr(self, 'previous_game') and current_game != self.previous_game
-        self.previous_game = current_game
-
-        if final_personality_prompt and (game_changed or not messages or messages[0].get("role") != "system"):
-            if messages and messages[0].get("role") == "system":
-                messages.pop(0)
-            messages.insert(0, {"role": "system", "content": final_personality_prompt})
-
-        # Process image if present
-        if image_path and messages and messages[-1]['role'] == 'user':
-            base64_image = encode_image(image_path)  # Assume encode_image is defined elsewhere
-            if base64_image:
-                if isinstance(messages[-1]['content'], list):
-                    messages[-1]['content'].append(
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
-                    )
-                else:
-                    existing_text = messages[-1]['content']
-                    messages[-1]['content'] = [
-                        {"type": "text", "text": existing_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
-                    ]
-
-        # Prepare data for the API request
-        data = {
-            "model": model,
-            "messages": messages,
-            "language": language,
-            "stream": True,
-            "reasoning": {
-                "effort": reasoning_effort,
-                "exclude": not show_reasoning
-            }
-        }
-
-        # Create a queue for TTS sentences
-        tts_queue = queue.Queue()
-
-        # Start the TTS worker thread
-        tts_worker = threading.Thread(target=self._tts_worker, args=(tts_queue,), daemon=True)
-        tts_worker.start()
-
-        # Initialize variables for response tracking
-        accumulated_text = ""
-        processed_up_to = 0
-        
-        # New variables for tracking thinking process
-        thinking_buffer = ""
-        last_thinking_summary_time = time.time()
-        thinking_summary_interval = 3.0  # Summarize every 3 seconds
-        in_thinking_mode = False
-
-        # Define chunk handler for LLM streaming
-        def process_llm_chunk(data_obj):
-            nonlocal accumulated_text, processed_up_to, thinking_buffer, last_thinking_summary_time, in_thinking_mode
-            if "choices" in data_obj and data_obj["choices"] and "delta" in data_obj["choices"][0]:
-                delta = data_obj["choices"][0]["delta"]
-
-                # Check for reasoning content in the delta
-                reasoning = delta.get("reasoning", "")
-                partial_content = delta.get("content", "")
-                
-                # If we have reasoning content, prepend the thinking emoji
-                if reasoning and show_reasoning:
-                    # We're in thinking mode
-                    in_thinking_mode = True
-                    
-                    # Add to thinking buffer
-                    thinking_buffer += reasoning
-                    
-                    # Add thinking emoji prefix if this is new reasoning content
-                    if not accumulated_text.startswith("🤔"):
-                        accumulated_text = "🤔 " + reasoning
-                    else:
-                        accumulated_text += reasoning
-                    
-                    # Update UI with reasoning text
-                    self._update_last_message(accumulated_text)
-                    
-                    # Check if it's time to create a thinking summary
-                    current_time = time.time()
-                    if current_time - last_thinking_summary_time > thinking_summary_interval and len(thinking_buffer) > 50:
-                        # Create a summary of the thinking
-                        summary = self._create_thinking_summary(thinking_buffer)
-                        
-                        # Speak the summary without showing it in chat
-                        if summary:
-                            # Use a separate thread to avoid blocking
-                            summary_thread = threading.Thread(
-                                target=self._speak_thinking_summary,
-                                args=(summary,),
-                                daemon=True
-                            )
-                            summary_thread.start()
-                        
-                        # Reset for next summary
-                        thinking_buffer = ""  # Keep some context
-                        last_thinking_summary_time = current_time
-                
-                # If we have regular content, use that instead
-                elif partial_content:
-                    # If switching from reasoning to regular content, reset accumulated_text
-                    if accumulated_text.startswith("🤔"):
-
-                        accumulated_text = ""
-                        processed_up_to = 0
-                        in_thinking_mode = False
-                        thinking_buffer = ""  # Clear thinking buffer
-                        
-                        # Stop thinking TTS to prevent audio overlap
-                        if self.thinking_tts_active:
-
-                            # Signal end of thinking summaries but with a slight delay
-                            self.after(800, lambda: self.thinking_tts_queue.put(None))
-
-                            # Clear the thinking TTS queue
-                            while not self.thinking_tts_queue.empty():
-                                try:
-                                    self.thinking_tts_queue.get_nowait()
-                                    self.thinking_tts_queue.task_done()
-                                except queue.Empty:
-                                    break
-                            
-                            # Signal end of thinking summaries
-                            self.thinking_tts_queue.put(None)
-                            
-                            # Add a small delay to ensure audio output transitions smoothly
-                            time.sleep(0.3)
-                    
-                    accumulated_text += partial_content
-
-                    # Find complete sentences for TTS
-                    while True:
-                        # Look for sentence-ending punctuation
-                        sentence_end = accumulated_text.find('.', processed_up_to)
-                        if sentence_end == -1:
-                            sentence_end = accumulated_text.find('!', processed_up_to)
-                        if sentence_end == -1:
-                            sentence_end = accumulated_text.find('?', processed_up_to)
-                        if sentence_end == -1:
-                            break  # No complete sentence yet
-
-                        # Extract and queue the sentence
-                        sentence = accumulated_text[processed_up_to:sentence_end + 1].strip()
-                        if sentence:
-                            # First, remove complete image prompts with brackets
-                            cleaned_sentence = re.sub(r'\[CREATE_IMAGE:.*?\]', '', sentence).strip()
-                            
-                            # Check for any "CREATE_IMAGE:" text with or without brackets
-                            if 'CREATE_IMAGE:' in cleaned_sentence:
-                                # Cut off everything from CREATE_IMAGE: to the end, regardless of brackets
-                                cleaned_sentence = cleaned_sentence.split('CREATE_IMAGE:')[0].strip()
-                                
-                            if cleaned_sentence:  # Only queue if there's content after cleaning
-                                sentence = cleaned_sentence
-                                tts_queue.put(cleaned_sentence)
-                            sentence = cleaned_sentence
-                        processed_up_to = sentence_end + 1
-
-                    # Update UI with regular text
-                    self._update_last_message(accumulated_text)
-
-        # Define completion handler
-        def on_llm_complete():
-
-            
-            
-            nonlocal accumulated_text, processed_up_to, thinking_buffer, in_thinking_mode
-            
-            # If we were in thinking mode and have buffer left, create a final summary
-            if in_thinking_mode and len(thinking_buffer) < 200:
-
-                summary = self._create_thinking_summary(thinking_buffer, is_final=True)
-                if summary:
-                    # Queue the final thinking summary with highest priority
-                    self._speak_thinking_summary(summary, True)
-                    
-                    # Signal the end of thinking summaries
-                    self.thinking_tts_queue.put(None)
-            else:
-                # If we weren't in thinking mode, make sure any thinking TTS is stopped
-                self.stop_thinking_tts()
-            
-            # Add any remaining text to the queue
-            if processed_up_to < len(accumulated_text):
-                remaining_text = accumulated_text[processed_up_to:].strip()
-                if remaining_text:
-                    tts_queue.put(remaining_text)
-            
-            # Signal the TTS worker to stop
-            tts_queue.put(None)
-
-            # Check for image generation requests
-            if "[CREATE_IMAGE:" in accumulated_text:
-                try:
-                    image_start = accumulated_text.find("[CREATE_IMAGE:")
-                    image_end = accumulated_text.find("]", image_start)
-                    if image_end > image_start:
-                        image_prompt = accumulated_text[image_start + 14:image_end].strip()
-
-                        # Clean the response for display
-                        cleaned_response = accumulated_text[:image_start].rstrip()
-                        self._update_last_message(cleaned_response)
-
-                        # Mark image as processed and generate it
-                        self.last_image_processed = image_prompt
-                        self.display_generated_image(image_prompt)
-                except Exception as e:
-                    logging.error(f"Error extracting image prompt: {e}")
-
-        # Call the streaming function with LLM parameters
-        stream_params = {
-            "api_key": openrouter_api_key,
-            "data": data
-        }
-
-        self.stream_api_response("llm", stream_params, process_llm_chunk, on_llm_complete)
-
-        # Construct a response object
-        response_obj = {
-            "choices": [
-                {
-                    "message": {
-                        "content": accumulated_text,
-                        "role": "assistant",
-                        "reasoning": None  # Add reasoning if needed
-                    }
-                }
-            ]
-        }
-
-        return response_obj
-    
-    def _create_thinking_summary(self, thinking_text, is_final=False):
-        """
-        Create a summary of the thinking process text.
-        
-        Args:
-            thinking_text (str): The thinking process text to summarize
-            is_final (bool): Whether this is the final summary
-            
-        Returns:
-            str: A summarized version of the thinking text
-        """
-        
-        # For longer thinking, extract a single meaningful complete sentence
-        # Split into sentences ensuring we get complete ones
-        sentences = re.split(r'(?<=[.!?])\s+', thinking_text)
-        
-        # Make sure we have valid sentences
-        valid_sentences = [s for s in sentences if len(s) > 10 and s.strip().endswith(('.', '!', '?'))]
-        if not valid_sentences:
-            return None
-        
-        if is_final:
-            return f"My final thought: {valid_sentences[-1]}"
-        
-        selected = valid_sentences[-1]
-        return selected
-
-    def _speak_thinking_summary(self, summary, is_final=False):
-        """
-        Queue the thinking summary to be spoken without overlapping.
-        
-        Args:
-            summary (str): The summary to speak
-            is_final (bool): Whether this is the final thinking summary
-        """
-        try:
-            # Start the worker if not already running
-            if not self.thinking_tts_active:
-                self.thinking_tts_worker = threading.Thread(
-                    target=self._thinking_tts_worker,
-                    daemon=True
-                )
-                self.thinking_tts_worker.start()
-            
-            # Priority: 1 for final summaries, 0 for regular ones
-            priority = 1 if is_final else 0
-            
-            # If a high priority message and speech is in progress, signal to stop
-            if priority == 1 and hasattr(self, 'speech_in_progress') and self.speech_in_progress.is_set():
-                self.thinking_tts_should_stop.set()
-                # Allow a moment for current speech to stop
-                time.sleep(0.2)
-                self.thinking_tts_should_stop.clear()
-            
-            # For regular priority messages, check if we should skip due to ongoing speech
-            elif priority == 0 and hasattr(self, 'speech_in_progress') and self.speech_in_progress.is_set():
-                # Skip non-final messages if speech is already in progress
-                return
-                
-            # Add to queue
-            self.thinking_tts_queue.put((summary, is_final, priority))
-            
-        except Exception as e:
-            logging.error(f"Error queueing thinking summary: {e}")
-
-    def _thinking_tts_worker(self):
-        """
-        Worker thread that processes thinking summaries from the queue
-        and ensures they don't overlap when spoken.
-        """
-        self.thinking_tts_active = True
-        self.thinking_tts_should_stop = threading.Event()
-        self.speech_in_progress = threading.Event()  # Track when speech is playing
-        
-        try:
-            last_speech_time = 0
-            min_interval_between_speech = 3.0  # Increased interval between thinking summaries
-            
-            while self.thinking_tts_active and not self.thinking_tts_should_stop.is_set():
-                try:
-                    # Get the next item (blocking with timeout)
-                    item = self.thinking_tts_queue.get(timeout=0.5)
-                    if item is None or self.skip_tts_var.get():
-                        # None is the signal to stop
-                        break
-                        
-                    summary, is_final, priority = item
-                    
-                    # Ensure we don't speak too frequently by checking time since last speech
-                    time_since_last_speech = time.time() - last_speech_time
-                    if time_since_last_speech < min_interval_between_speech and not is_final:
-                        # Skip this thinking update if it's too soon after the previous one
-                        # unless it's the final summary
-                        self.thinking_tts_queue.task_done()
-                        continue
-                    
-                    # Check if we should stop before starting new audio
-                    if self.thinking_tts_should_stop.is_set():
-                        self.thinking_tts_queue.task_done()
-                        break
-                    
-                    # Process this thinking summary
-                    selected_output_index = self.audio_output_combobox.current()
-                    device_id = None
-                    if selected_output_index >= 0 and self.available_output_devices:
-                        _, device_id = self.available_output_devices[selected_output_index]
-                    
-                    # Convert to speech
-                    selected_language = self.map_language_to_code(self.language_var.get())
-                    text_with_spoken_numbers = self.convert_numbers_to_words(summary, selected_language)
-                    
-                    # Mark speech as in progress
-                    self.speech_in_progress.set()
-                    
-                    # Use TTS API
-                    stream_params = {
-                        "api_key": self.openai_key,
-                        "text": text_with_spoken_numbers,
-                        "device_id": device_id,
-                    }
-                    
-                    def check_stop_signal(chunk, is_first):
-                        # Return whether to continue streaming
-                        return not self.thinking_tts_should_stop.is_set()
-                    
-                    # This will block until the speech is complete
-                    self.stream_api_response(
-                        "tts", 
-                        stream_params, 
-                        check_stop_signal
-                    )
-                    
-                    last_speech_time = time.time()
-                    
-                    # Add a small pause after speech to ensure clean transition
-                    time.sleep(0.3)
-                    
-                    # Mark speech as complete
-                    self.speech_in_progress.clear()
-                    
-                    # Add a longer pause after final speech
-                    if is_final:
-                        time.sleep(0.5)
-                    
-                    self.thinking_tts_queue.task_done()
-                    
-                except queue.Empty:
-                    # Queue timeout, check if we should continue
-                    continue
-        except Exception as e:
-            logging.error(f"Error in thinking TTS worker: {e}")
-        finally:
-            self.thinking_tts_active = False
-            self.thinking_tts_should_stop.clear()
-            self.speech_in_progress.clear()
-
-    def stop_thinking_tts(self):
-        """Stop any ongoing thinking TTS playback"""
-        if hasattr(self, 'thinking_tts_should_stop'):
-            self.thinking_tts_should_stop.set()
-            
-        # Clear the queue
-        if hasattr(self, 'thinking_tts_queue'):
-            while not self.thinking_tts_queue.empty():
-                try:
-                    self.thinking_tts_queue.get_nowait()
-                    self.thinking_tts_queue.task_done()
-                except queue.Empty:
-                    break
-                    
-        # Signal end
-        self.thinking_tts_queue.put(None)
-    
-    def _tts_worker(self, tts_queue):
-        """Modified worker that handles TTS with automatic muting and unmuting."""
-        
-        while True:
-            text = tts_queue.get()
-            if text is None or self.skip_tts_var.get():
-                break  # Exit when None is received
-
-            # Combine multiple sentences if available
-            while not tts_queue.empty():
-                next_text = tts_queue.get()
-                if next_text is None:
-                    tts_queue.put(None)  # Put back the None to signal end
-                    break
-                text += " " + next_text
-                # Limit text length to avoid overwhelming TTS
-                if len(text) > 3000:
-                    break
-
-            try:
-                self.tts_queue_completed = False  # Reset flag
-                # Store current audio source state and mute
-                print("muted by tts")
-                self.audio_source_toggle_var.set("mute")
-                self.update_status("AI speaking...")
-
-                selected_language = self.map_language_to_code(self.language_var.get())
-
-                if selected_language != "en":
-                    # Convert numbers to spoken words for OTHER LANGUAGES THAN ENGLISH FOR TTS, because it will not handle numbers correctly in other languages. Additionally "=, and other markers are poorly handled in other than English, but this does not fix that".
-                    text_with_spoken_numbers = self.convert_numbers_to_words(text, selected_language)
-                else:
-                    text_with_spoken_numbers = text
-                
-
-                # Get output device
-                selected_output_index = self.audio_output_combobox.current()
-                device_id = None
-                if selected_output_index >= 0 and self.available_output_devices:
-                    _, device_id = self.available_output_devices[selected_output_index]
-
-                # Use stream API for TTS with blocking until complete
-                self.stream_api_response(
-                    api_type = "tts",
-                    request_params = {
-                        "api_key": self.openai_key,
-                        "text": text_with_spoken_numbers,
-                        "device_id": device_id,
-                    },
-                    on_chunk_received = lambda chunk, first: None,
-                    on_complete = None
-                )
-
-                print("full TTS playback complete")
-                self.tts_queue_completed = True  # Set flag in finally block
-
-                def unmute_after_tts():
-                    if self.current_tts_stream_completed:
-                        # Reset listening queues before unmuting
-                        while not self.audio_queue1.empty():
-                            self.audio_queue1.get()
-                        while not self.audio_queue2.empty():
-                            self.audio_queue2.get()
-                            
-                        # Restore original saved audio state instead of any intermediate state
-                        original_state = self.saved_audio_state  # Use the originally saved state
-                        print(f"unmuted by tts - restoring original state: {original_state}")
-                        self.audio_source_toggle_var.set(original_state)
-                        self.update_status("Listening...")                        
-                    else:
-                        self.after(1000, unmute_after_tts)
-                self.after(1000, unmute_after_tts)
-                
-            except Exception as e:
-                logging.error(f"Error during TTS processing: {e}")
-                self.after(0, lambda: self.append_message(f"Error during TTS: {e}", sender='system'))
-
-                # Ensure we restore audio state even on error
-                original_state = self.saved_audio_state
-                print(f"unmuted by tts - restoring original state: {original_state}")
-                self.audio_source_toggle_var.set(original_state)
-                self.update_status("Listening...")
-
-            tts_queue.task_done()
-
-
-    def convert_numbers_to_words(self, text, language='fi'):
-        """
-        Convert numbers in text to their word representations for better TTS.
-        
-        Args:
-            text (str): Text containing numbers
-            language (str): Language code for conversion (fi, en, sv, es)
-        
-        Returns:
-            str: Text with numbers converted to words
-        """
-        if not text:
-            return text
-        
-        # Map language codes from the app to num2words format
-        lang_map = {
-            'fi': 'fi',
-            'en': 'en',
-            'sv': 'sv',
-            'es': 'es'
-        }
-        
-        # Get appropriate language code
-        lang = lang_map.get(language, 'en')
-        
-        # Function to convert a matched number
-        def replace_number(match):
-            try:
-                num = match.group(0).replace(',', '.')  # Handle decimal comma format
-                # Convert only numbers that look reasonable to convert (not very long numbers)
-                if len(num) > 15:  # Skip very long numbers
-                    return match.group(0)
-                    
-                # Handle decimal numbers
-                if '.' in num:
-                    integer_part, decimal_part = num.split('.')
-                    if integer_part:
-                        integer_words = num2words(int(integer_part), lang=lang)
-                    else:
-                        integer_words = "zero"
-                    
-                    # Handle decimal part differently based on language
-                    if decimal_part:
-                        if lang == 'fi':
-                            decimal_words = " pilkku " + " ".join([num2words(int(d), lang=lang) for d in decimal_part])
-                        else:
-                            decimal_words = " point " + " ".join([num2words(int(d), lang=lang) for d in decimal_part])
-                        return f"{integer_words}{decimal_words}"
-                    else:
-                        return integer_words
-                else:
-                    # Handle integers
-                    return num2words(int(num), lang=lang)
-            except Exception as e:
-                logging.error(f"Error converting number '{match.group(0)}' to words: {e}")
-                return match.group(0)
-        
-        # Find numbers (allowing for decimal notation) and replace them
-        processed_text = re.sub(r'\b\d+[,\.]?\d*\b', replace_number, text)
-        return processed_text    
-
-    def reset_conversation(self):
-        global messages
-        messages = []
-        self.append_message("Conversation has been reset. You can start a new conversation.", sender="system")
-
 
     def check_game_over(self):
         if self.chess_board.is_game_over():
@@ -3744,181 +4337,6 @@ class ChatAudioApp5(tk.Tk):
             logging.error(f"Unexpected response format: {e}")
             self.after(0, lambda: self.handle_error(f"Unexpected response format from LLM: {e}"))
 
-    
-
-    def _update_last_message(self, text):
-        """Update the last message in the chat UI with new content"""
-        if hasattr(self, "last_message_frame") and self.last_message_frame:
-            # Find the bubble (Label) widget in the last message frame
-            for child in self.last_message_frame.winfo_children():
-                if isinstance(child, tk.Label) and child.cget("bg") == "#FFFFFF":  # Assistant message background
-                    # Ensure proper encoding for Finnish characters
-                    try:
-                        # Special formatting for reasoning/thinking text
-                        if text.startswith("🤔") or text.startswith("🧠"):
-                            child.config(
-                                text=text,
-                                fg="#555555",  # Darker gray text for thinking
-                                font=("Arial", 10, "italic")  # Italic font for thinking
-                            )
-                        else:
-                            # Normal text for regular responses
-                            child.config(
-                                text=text,
-                                fg="black",
-                                font=("Arial", 10)
-                            )
-                    except Exception as e:
-                        logging.error(f"Error updating text with special characters: {e}")
-                        # Fallback method if there are encoding issues
-                        try:
-                            sanitized_text = text.encode('utf-8', errors='replace').decode('utf-8')
-                            child.config(text=sanitized_text)
-                        except:
-                            # Last resort fallback
-                            child.config(text="[Text encoding error]")
-                    
-                    # Update the canvas to show changes
-                    self.chat_canvas.update_idletasks()
-                    self.chat_canvas.yview_moveto(1.0)
-                    break
-
-    def add_reasoning_controls(self, settings_frame):
-        """Add reasoning controls to the settings frame"""
-        reasoning_frame = ttk.LabelFrame(settings_frame, text="AI Reasoning")
-        reasoning_frame.pack(fill="x", padx=10, pady=5)
-        
-        # Reasoning effort selection
-        ttk.Label(reasoning_frame, text="Reasoning Effort:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.reasoning_effort_var = tk.StringVar(value="medium")
-        reasoning_combo = ttk.Combobox(reasoning_frame, textvariable=self.reasoning_effort_var, 
-                                    values=["low", "medium", "high"])
-        reasoning_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
-        
-        # Show reasoning checkbox
-        self.show_reasoning_var = tk.BooleanVar(value=True)
-        show_reasoning_check = ttk.Checkbutton(reasoning_frame, text="Show AI reasoning process", 
-                                            variable=self.show_reasoning_var)
-        show_reasoning_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=5)
-        
-        # Help text
-        help_text = ("Low effort: Basic reasoning\n"
-                    "Medium effort: Balanced reasoning\n"
-                    "High effort: Detailed, multi-step reasoning")
-        ttk.Label(reasoning_frame, text=help_text, font=("TkDefaultFont", 8), 
-                foreground="gray").grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
-
-    def save_and_process_audio(self, recorded_frames, selected_language, client, openrouter_api_key, selected_model):
-        """
-        Save recorded frames, transcribe, and process through LLM based on context.
-        """
-        self.ai_tried_chess_move = False
-        self.chess_game_ended = False
-        image_path = None
-        
-        # Save audio data to file
-        try:
-            recorded_audio = np.concatenate(recorded_frames, axis=0)
-            wavio.write(RECORDED_AUDIO_PATH, recorded_audio, rate=self.sample_rate1, sampwidth=2)
-            self.update_status("Voice input saved")
-            self.append_message(f"Tallennettu ääni: {RECORDED_AUDIO_PATH}", "system")
-            logging.info(f"Recording saved to {RECORDED_AUDIO_PATH}")
-        except Exception as e:
-            logging.error(f"Error saving recorded audio: {e}")
-            self.handle_error(f"Error saving recorded audio: {e}")
-            return
-
-        # Transcribe audio using Whisper
-        try:
-            user_input = self._transcribe_audio(client, selected_language)
-            if not user_input:
-                return
-        except Exception as e:
-            logging.error(f"Error during transcription: {e}")
-            self.handle_error(f"Transcription error: {e}")
-            return
-        
-        # Check for attached PDF content
-        user_input = self._add_pdf_content_if_exists(user_input)
-        
-        # Check if user wants music generation
-        if self.wants_pop_song(user_input):
-            self._handle_music_generation(user_input)
-            return
-            
-        # Process based on current game mode
-        current_game = self.game_var.get()
-        
-        # Handle image if not in chess mode
-        if current_game != "Chess" and self.send_image_var.get():
-            image_path = select_latest_image()
-            if image_path:
-                self.append_image_in_chat(image_path, sender="user")
-                
-        # Process based on game mode
-        if current_game == "Chess":
-            self._handle_chess_input(user_input, selected_language, openrouter_api_key, selected_model, image_path)
-        else:
-            self._handle_normal_chat(user_input, selected_language, openrouter_api_key, selected_model, image_path)
-
-    def _transcribe_audio(self, client, selected_language):
-        """Transcribe audio file and validate result"""
-        try:
-            with open(RECORDED_AUDIO_PATH, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    language=selected_language
-                )
-                
-                lang_display = {
-                    'fi': "Finnish",
-                    'sv': "Swedish",
-                    'es': "Spanish"
-                }.get(selected_language, "English")
-                self.update_status("Recorded audio converted to text")
-                logging.info(f"User said ({lang_display}): {transcription.text}")
-                
-                # Validate transcription
-                if not is_valid_transcription(transcription.text, blacklist=self.excluded_phrases):
-                    self.update_status("Voice input failed")
-                    logging.info(f"Filtered out transcription: {transcription.text}")
-                    self.append_message(
-                        "Unrecognized or irrelevant audio was detected and ignored.",
-                        sender="system"
-                    )
-                    return None
-                    
-                self.append_message(transcription.text, sender="user")
-                return transcription.text
-                
-        except FileNotFoundError:
-            logging.error(f"File not found: {RECORDED_AUDIO_PATH}.")
-            self.handle_error(f"File not found: {RECORDED_AUDIO_PATH}")
-            return None
-
-    def _add_pdf_content_if_exists(self, user_input):
-        """Check for and add PDF content if available"""
-        text_file_path = Path(r"C:\\Users\\ronit\\OneDrive\\Tiedostot\\extracted_pdf_data\\text\\full_text.txt")
-        if text_file_path.exists():
-            try:
-                extracted_content = text_file_path.read_text(encoding='utf-8')
-                user_input += f"\n\n[Extracted PDF Content]\n{extracted_content}"
-                text_file_path.unlink()  # Delete the file
-                self.append_message("Added extracted PDF content to the message.", sender="system")
-            except Exception as e:
-                self.append_message(f"Error processing text file: {e}", sender="system")
-        return user_input
-
-    def _handle_music_generation(self, user_input):
-        """Process music generation request"""
-        self.append_message("It seems you want a song. Let me create one for you...", sender="assistant")
-
-        result = self.generate_and_play_music(user_input, is_task=False)
-
-        if not result:
-            self.append_message("I encountered an issue creating your music.", sender="assistant")
-
     def _handle_chess_input(self, user_input, selected_language, openrouter_api_key, selected_model, image_path):
         """Process input in chess game mode"""
         global messages
@@ -3964,87 +4382,6 @@ class ChatAudioApp5(tk.Tk):
                 openrouter_api_key, 
                 selected_model
             )
-
-    def _handle_normal_chat(self, user_input, selected_language, openrouter_api_key, selected_model, image_path):
-        """Process input in normal chat mode"""
-        global messages
-        
-        # Add user message to conversation history
-        messages.append({"role": "user", "content": user_input})
-
-        self.update_status("Having a conversation...")
-
-        # Add placeholder message before streaming begins
-        self.append_message("Thinking about your message...", sender="assistant")
-        
-        # Send to LLM and process response
-        self._process_llm_response(
-            messages, 
-            image_path, 
-            selected_language, 
-            openrouter_api_key, 
-            selected_model
-        )
-
-    def _process_llm_response(self, message_list, image_path, selected_language, openrouter_api_key, selected_model):
-        """Send messages to LLM and process the response"""
-        global messages
-
-        # Get reasoning settings from UI
-        reasoning_effort = self.reasoning_effort_var.get()
-        show_reasoning = self.show_reasoning_var.get()
-        
-        # Pass to OpenRouter function
-        response_json = self.send_message(
-            message_list,
-            image_path=image_path,
-            language=selected_language,
-            openrouter_api_key=openrouter_api_key,
-            model=selected_model,
-            reasoning_effort=reasoning_effort,
-            show_reasoning=show_reasoning
-        )
-        
-        if not response_json:
-            return
-            
-        try:
-            assistant_response = response_json['choices'][0]['message']['content']
-            logging.info(f"Assistant: {assistant_response}")
-            
-            # Check if image was already processed during streaming
-            already_processed = hasattr(self, 'last_image_processed')
-            
-            # Check for image generation instructions only if not already processed
-            if not already_processed:
-                prompt_for_image = None
-                pattern = r"\[CREATE_IMAGE:\s*(.*?)\]"
-                match = re.search(pattern, assistant_response)
-                
-                if match:
-                    prompt_for_image = match.group(1).strip()
-                    cleaned_response = re.sub(pattern, '', assistant_response).strip()
-                    self.display_generated_image(prompt_for_image)
-                    
-                    # If response only contained image prompt
-                    if not cleaned_response:
-                        return
-                else:
-                    cleaned_response = assistant_response
-            else:
-                # Image already processed, just clean the response
-                pattern = r"\[CREATE_IMAGE:\s*(.*?)\]"
-                cleaned_response = re.sub(pattern, '', assistant_response).strip()
-                # Reset the flag
-                delattr(self, 'last_image_processed')
-            
-            # update conversation history
-            messages.append({"role": "assistant", "content": assistant_response})
-         
-            
-        except (IndexError, KeyError) as e:
-            logging.error(f"Unexpected response format: {e}")
-            self.handle_error(f"Unexpected response format from LLM: {e}")
 
     def _extract_chess_move(self, text):
         """Extract chess move from text, returns (from_sq_index, to_sq_index, promotion) or None"""
@@ -4281,8 +4618,6 @@ class ChatAudioApp5(tk.Tk):
         # No valid move pattern found
         return None
 
-
-
     def _find_source_square(self, piece_type, dest_sq_index, promotion=None):
         """
         Find the source square for a piece of given type that can move to the destination.
@@ -4316,7 +4651,6 @@ class ChatAudioApp5(tk.Tk):
             self.append_message(f"No {chess.piece_name(piece_type)} can move to {chess.square_name(dest_sq_index)}.", sender="system")
         
         return None
-    
 
     def _find_capture_destination(self, from_sq_index):
         """
@@ -4343,26 +4677,9 @@ class ChatAudioApp5(tk.Tk):
         
         return None
 
-
-
     import re
     import chess
     import logging
-
-    def start_progress_bar(self, estimated_duration):
-        self.progress_bar['value'] = 0
-        self.progress_bar['maximum'] = estimated_duration * 1000  # ms
-        self._progress_start_time = time.time()
-        self.update_progress_bar()
-
-    # You need to modify update_progress_bar to accept a progress parameter
-    def update_progress_bar(self, progress=None):
-        elapsed = (time.time() - self._progress_start_time) * 1000
-        self.progress_bar['value'] = elapsed
-        if elapsed < self.progress_bar['maximum']:
-            self.after(100, self.update_progress_bar)
-        else:
-            self.progress_bar['value'] = self.progress_bar['maximum']
 
     def extract_move(self, response_text):
         """
@@ -4499,8 +4816,8 @@ class ChatAudioApp5(tk.Tk):
         # (Vaihtoehtoisesti, voit lisätä myös debug-printauksen:
         print("Setting 'show_ai_only_valid_moves' is now:", self.show_ai_only_valid_moves)
 
+    #------------------------------Configuration & Settings---------------------------------
 
-    # ------------- Load/Save Config & Blacklist -------------
     def load_existing_api_keys(self):
         openai_key = self.config_data.get('OPENAI_API_KEY', '')
         openrouter_key = self.config_data.get('OPENROUTER_API_KEY', '')
@@ -4562,8 +4879,6 @@ class ChatAudioApp5(tk.Tk):
         # Load TTS voice if available
         if hasattr(self, 'tts_voice_var') and 'TTS_VOICE' in self.config_data:
             self.tts_voice_var.set(self.config_data.get('TTS_VOICE', 'alloy'))
-
-
 
     def save_api_keys(self):
         openai_key = self.openai_key_var.get().strip()
@@ -4753,7 +5068,6 @@ class ChatAudioApp5(tk.Tk):
                 messagebox.showinfo("Deleted", f"Personality '{name}' deleted.")
                 self.update_personalities_listbox()
 
-
     def generate_personality_prompt(self):
         """
         Reads the short description from the text box and asks the LLM to expand it
@@ -4810,14 +5124,26 @@ class ChatAudioApp5(tk.Tk):
             self.handle_error(f"Error processing personality prompt: {e}")
 
     def check_api_keys(self):
-        if hasattr(self, 'openai_key') and hasattr(self, 'openrouter_key'):
+        """Check if API keys are available and set flag"""
+        self.openai_key = self.config_data.get('OPENAI_API_KEY', '')
+        self.openrouter_key = self.config_data.get('OPENROUTER_API_KEY', '')
+        
+        # If using local Whisper, we only need OpenRouter key for LLM
+        if self.use_local_whisper_var.get():
+            if self.openrouter_key:
+                self.api_keys_provided = True
+                logging.info("Using local Whisper with OpenRouter key")
+            else:
+                self.api_keys_provided = False
+                messagebox.showerror("Error", "OpenRouter API key is required for LLM.")
+        else:
+            # Otherwise we need both OpenAI and OpenRouter keys
             if self.openai_key and self.openrouter_key:
                 self.api_keys_provided = True
-                self.append_message("API keys already loaded from config.", sender="system")
-                return
-
-        self.api_keys_provided = False
-        self.append_message("Please enter your API keys and click 'Save API Keys' to start.", sender="system")
+                logging.info("Both API keys loaded")
+            else:
+                self.api_keys_provided = False
+                messagebox.showerror("Error", "Both OpenAI and OpenRouter API keys must be provided.")
 
     def add_model(self):
         def save_new_model():
@@ -4871,7 +5197,172 @@ class ChatAudioApp5(tk.Tk):
             save_config(self.config_data)
             messagebox.showinfo("Success", f"Model '{selected_model}' has been removed.")
 
-    #_______________Image Generation________________________________
+    def on_language_changed(self, event):
+        """Handle language selection changes and restart listening if active"""
+        new_language = self.language_var.get()
+        self.append_message(f"Language changed to: {new_language}", sender="system")
+        
+        # Restart the listening process with the new language
+        if hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.is_alive():
+            # Stop current listening process
+            self.stop_listening()
+            # Small delay to ensure cleanup completes
+            self.after(500, self.start_listening)
+        else:
+            # If not already running, just update the status
+            self.append_message("Language will be used for the next conversation", sender="system")
+
+    def on_model_changed(self, event):
+        """Handle model selection changes and restart listening if active"""
+        new_model = self.model_var.get()
+        self.append_message(f"Model changed to: {new_model}", sender="system")
+
+        # Restart the listening process with the new model
+        if hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.is_alive():
+            # Stop current listening process
+            self.stop_listening()
+            # Small delay to ensure cleanup completes
+            self.after(500, self.start_listening)
+        else:
+            # If not already running, just update the status
+            self.append_message("Model will be used for the next conversation", sender="system")        
+
+    def map_language_to_code(self, lang_name):
+        lookup = {
+            "Finnish": "fi",
+            "Swedish": "sv",
+            "Spanish": "es",
+            "English": "en"
+        }
+        return lookup.get(lang_name, "en")
+
+    def browse_image_path(self):
+        """Let the user pick a default image directory."""
+        selected_path = filedialog.askdirectory(
+            initialdir=self.image_path_var.get() or DEFAULT_IMAGE_DIR,
+            title="Select Default Image Directory"
+        )
+        if selected_path:
+            self.image_path_var.set(selected_path)
+
+    def save_reasoning_settings(self):
+        self.config_data['REASONING_EFFORT'] = self.reasoning_effort_var.get()
+        self.config_data['SHOW_REASONING'] = self.show_reasoning_var.get()
+        
+        # Save to config file
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config_data, f, indent=4)
+        
+        messagebox.showinfo("Settings Saved", "Reasoning settings saved successfully.")
+
+    def save_mureka_keys(self):
+        mureka_url = self.mureka_url_var.get().strip()
+        mureka_account = self.mureka_account_var.get().strip()
+        mureka_token = self.mureka_token_var.get().strip()
+
+        if not mureka_url or not mureka_account or not mureka_token:
+            messagebox.showerror("Error", "All Mureka API fields must be filled.")
+            return
+
+        if not messagebox.askyesno("Confirm", "Are you sure you want to save the provided Mureka API keys?"):
+            return
+
+        self.config_data['MUREKA_API_URL'] = mureka_url
+        self.config_data['MUREKA_ACCOUNT'] = mureka_account
+        self.config_data['MUREKA_API_TOKEN'] = mureka_token
+
+        save_config(self.config_data)
+        messagebox.showinfo("Success", "Mureka API keys saved successfully.")
+
+        self.mureka_token_var.set("******")  # Don't display the actual token
+        self.append_message("Mureka API keys loaded successfully.", sender="system")
+
+    def load_mureka_settings(self):
+        mureka_url = self.config_data.get('MUREKA_API_URL', '')
+        mureka_account = self.config_data.get('MUREKA_ACCOUNT', '')
+        mureka_token = self.config_data.get('MUREKA_API_TOKEN', '')
+
+        self.mureka_url_var.set(mureka_url)
+        self.mureka_account_var.set(mureka_account)
+        if mureka_token:
+            self.mureka_token_entry.insert(0, "******") # Oikein. Lisätään Entry-widgettiin
+            self.mureka_token_entry.config(show="*")  # Varmistetaan, että Entry näyttää tähdet
+
+    #---------------------------------Whisper (Speech Recognition)---------------------------------
+
+    def toggle_whisper_settings(self):
+        """Enable or disable Whisper model settings based on checkbox state"""
+        state = "normal" if self.use_local_whisper_var.get() else "disabled"
+        self.whisper_model_combobox.config(state=state)
+        self.whisper_status_label.config(
+            text="Status: Not loaded" if not self.use_local_whisper_var.get() else "Status: Ready to load"
+        )
+
+    def save_whisper_settings(self):
+        """Save Whisper settings and load model if local Whisper is enabled"""
+        use_local = self.use_local_whisper_var.get()
+        model_size = self.whisper_model_var.get()
+        
+        self.config_data['USE_LOCAL_WHISPER'] = use_local
+        self.config_data['WHISPER_MODEL'] = model_size
+        
+        # Save to config file
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config_data, f, indent=4)
+        
+        # Load model if enabled
+        if use_local:
+            self.load_whisper_model()
+        else:
+            self.whisper_model = None
+            self.whisper_status_label.config(text="Status: Using OpenAI API")
+        
+        messagebox.showinfo("Settings Saved", "Whisper settings saved successfully.")
+
+    def load_whisper_model(self):
+        """Load the selected Whisper model in a background thread"""
+        self.whisper_status_label.config(text="Status: Loading model...", fg="orange")
+        self.update_idletasks()
+        
+        # Start loading in a background thread to prevent UI freezing
+        self.start_thread(
+            target=self._background_load_whisper_model,
+            thread_name="WhisperModelLoader"
+        )
+
+    def _background_load_whisper_model(self):
+        """Load Whisper model in background thread"""
+        model_size = self.whisper_model_var.get()
+        try:
+            # Update status on the main thread
+            self.after(0, lambda: self.whisper_status_label.config(
+                text=f"Status: Loading {model_size} model...", 
+                fg="orange"
+            ))
+            
+            # Load the model (this may take time depending on model size)
+            self.whisper_model = whisper.load_model(model_size)
+            
+            # Update status on success
+            self.after(0, lambda: self.whisper_status_label.config(
+                text=f"Status: {model_size} model loaded successfully", 
+                fg="green"
+            ))
+            self.append_message(f"Local Whisper {model_size} model loaded successfully", sender="system")
+            
+        except Exception as e:
+            error_msg = f"Failed to load Whisper model: {str(e)}"
+            logging.error(error_msg)
+            
+            # Update status on error
+            self.after(0, lambda: self.whisper_status_label.config(
+                text=f"Status: Failed to load model", 
+                fg="red"
+            ))
+            self.append_message(f"Error loading Whisper model: {str(e)}", sender="system")    
+
+    #---------------------------------Image Generation & Display---------------------------------
+
     def generate_image(self, prompt):
         """
         Call OpenAI's Image Generation API (e.g. DALL-E) and return the generated image URL.
@@ -4978,36 +5469,6 @@ class ChatAudioApp5(tk.Tk):
             thread_name=f"ImageGenThread-{datetime.now().strftime('%H%M%S')}"
         )
 
-    def pulsing_animation(self, label, alpha=1.0, decreasing=True, interval=100):
-        """
-        Create a pulsing text effect by changing opacity gradually.
-        """
-        # Store animation state in the label to be able to stop it later
-        if not hasattr(label, "animation_running"):
-            label.animation_running = True
-        
-        # Stop the animation if it should no longer run
-        if not hasattr(label, "animation_running") or not label.animation_running:
-            return
-        
-        # Update alpha (opacity)
-        if decreasing:
-            alpha -= 0.1
-            if alpha <= 0.3:
-                decreasing = False
-        else:
-            alpha += 0.1
-            if alpha >= 1.0:
-                decreasing = True
-        
-        # Apply opacity to text color
-        gray_value = int(alpha * 255)
-        color = f"#{gray_value:02x}{gray_value:02x}{gray_value:02x}"
-        label.config(fg=color)
-        
-        # Schedule the next animation frame
-        self.after(interval, lambda: self.pulsing_animation(label, alpha, decreasing, interval))
-
     def generate_and_display_image(self, prompt, loading_frame):
         """
         Generate an image and replace the loading animation with the actual image.
@@ -5037,11 +5498,17 @@ class ChatAudioApp5(tk.Tk):
                     child.animation_running = False
                     child.config(text=f"Failed to generate image for: {prompt}", fg="red")
 
-    
+    #---------------------------------Music Generation---------------------------------
 
+    def _handle_music_generation(self, user_input):
+        """Process music generation request"""
+        self.append_message("It seems you want a song. Let me create one for you...", sender="assistant")
 
+        result = self.generate_and_play_music(user_input, is_task=False)
 
-    #_________________________Music generation______________________________
+        if not result:
+            self.append_message("I encountered an issue creating your music.", sender="assistant")
+
     def call_mureka_music_api(self, prompt: str):
         """
         Calls the Mureka music creation API with the given prompt.
@@ -5074,7 +5541,6 @@ class ChatAudioApp5(tk.Tk):
             #self.append_message(f"Error calling Mureka: {e}", sender="system")
             self.after(0, self.append_message, f"Error calling Mureka: {e}", "system")
             return []
-
 
     def play_music_from_url(self, mp3_url: str):
         try:
@@ -5124,7 +5590,6 @@ class ChatAudioApp5(tk.Tk):
         except Exception as e:
             self.append_message(f"Failed to play music: {e}", sender="system")
 
-
     def wants_pop_song(self, user_input: str) -> bool:
         """
         Ask the LLM: "Does the user's text indicate that they want a pop song?"
@@ -5169,135 +5634,147 @@ class ChatAudioApp5(tk.Tk):
             return tokens[0] == 'yes'
         except (IndexError, KeyError):
             return False
-        
 
-
+    def generate_and_play_music(self, base_prompt, is_task=False):
+        """
+        Unified function to generate and play music based on a prompt with streaming.
         
-    def create_tasks_tab(self):
-        """Create or update the tasks tab with enhanced features"""
-        # Clear any existing content in the tasks tab
-        for widget in self.tasks_tab.winfo_children():
-            widget.destroy()
-            
-        # Create main frame for tasks
-        tasks_frame = tk.Frame(self.tasks_tab)
-        tasks_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        Args:
+            base_prompt: User input or task description to base music on
+            is_task: Boolean indicating if this is for a task reminder (affects prompt)
         
-        # Task filter options
-        filter_frame = tk.Frame(tasks_frame)
-        filter_frame.pack(fill=tk.X, pady=(0, 10))
+        Returns:
+            Boolean: True if music was successfully played
+        """
         
-        self.task_filter_var = tk.StringVar(value="all")
-        tk.Label(filter_frame, text="Show tasks:").pack(side=tk.LEFT, padx=(0, 10))
-        
-        tk.Radiobutton(filter_frame, text="All", variable=self.task_filter_var, 
-                    value="all", command=self.refresh_tasks_list).pack(side=tk.LEFT, padx=5)
-        tk.Radiobutton(filter_frame, text="Active", variable=self.task_filter_var,
-                    value="active", command=self.refresh_tasks_list).pack(side=tk.LEFT, padx=5)
-        tk.Radiobutton(filter_frame, text="Completed", variable=self.task_filter_var,
-                    value="completed", command=self.refresh_tasks_list).pack(side=tk.LEFT, padx=5)
-        
-        # Tasks list with scrollbar
-        list_frame = tk.Frame(tasks_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.tasks_listbox = tk.Listbox(list_frame, selectmode=tk.SINGLE, font=("Arial", 11), height=15)
-        self.tasks_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tasks_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tasks_listbox.config(yscrollcommand=scrollbar.set)
-        
-        # Action buttons
-        buttons_frame = tk.Frame(tasks_frame)
-        buttons_frame.pack(fill=tk.X, pady=10)
-        
-        # Add task button
-        add_button = tk.Button(buttons_frame, text="Add Task", 
-                            command=self.show_add_task_dialog, width=15)
-        add_button.pack(side=tk.LEFT, padx=5)
-        
-        # Toggle completion button
-        toggle_button = tk.Button(buttons_frame, text="Toggle Completion", 
-                                command=self.toggle_selected_task, width=15)
-        toggle_button.pack(side=tk.LEFT, padx=5)
-        
-        # Delete task button
-        delete_button = tk.Button(buttons_frame, text="Delete Task", 
-                                command=self.delete_selected_task, bg="#FF5733", fg="white", width=15)
-        delete_button.pack(side=tk.LEFT, padx=5)
-
-        # Schedule controls
-        schedule_frame = tk.LabelFrame(self.tasks_tab, text="Work/Break Schedule", padx=10, pady=10)
-        schedule_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        tk.Label(schedule_frame, text="Work duration (minutes):").grid(row=0, column=0, sticky="w")
-        self.work_entry = tk.Entry(schedule_frame, width=10)
-        self.work_entry.grid(row=0, column=1, padx=5, pady=5)
-        
-        tk.Label(schedule_frame, text="Break duration (minutes):").grid(row=1, column=0, sticky="w")
-        self.break_entry = tk.Entry(schedule_frame, width=10)
-        self.break_entry.grid(row=1, column=1, padx=5, pady=5)
-        
-        self.start_button = tk.Button(schedule_frame, text="Start Schedule", command=self.start_schedule, width=15)
-        self.start_button.grid(row=2, column=0, pady=5)
-        
-        self.stop_button = tk.Button(schedule_frame, text="Stop Schedule", command=self.stop_schedule, width=15, state=tk.DISABLED)
-        self.stop_button.grid(row=2, column=1, pady=5)
-        
-        self.schedule_status_label = tk.Label(schedule_frame, text="Schedule not running", font=("Arial", 10))
-        self.schedule_status_label.grid(row=3, column=0, columnspan=2, pady=5)
-        
-        self.work_entry.insert(0, str(self.config_data.get('WORK_DURATION', 25)))
-        self.break_entry.insert(0, str(self.config_data.get('BREAK_DURATION', 5)))
-        self.refresh_tasks_list()        
-        
-        # Initial load of tasks
-        self.refresh_tasks_list()
-
-    def start_schedule(self):
-        try:
-            work_minutes = int(self.work_entry.get())
-            break_minutes = int(self.break_entry.get())
-            if work_minutes <= 0 or break_minutes <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter positive integers for durations.")
-            return
-        
-        self.work_duration = work_minutes * 60
-        self.break_duration = break_minutes * 60
-        self.schedule_running = True
-        self.current_state = "working"
-        
-        # Add initial work task
-        now = datetime.now()
-        self.task_manager.add_task(
-            description="[SCHEDULE] Start working",
-            due_date=now,
-            priority="High"
-        )
-        self.refresh_tasks_list()
-        self.append_message("Schedule started.", sender="system")
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-        self.update_schedule_display()
-        self.check_due_tasks()  # Immediate check
-
-    def stop_schedule(self):
-        self.schedule_running = False
-        self.current_state = None
-        self.schedule_status_label.config(text="Schedule not running")
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self.append_message("Schedule stopped.", sender="system")
-
-    def update_schedule_display(self):
-        if self.schedule_running:
-            state_str = self.current_state if self.current_state else "starting"
-            self.schedule_status_label.config(text=f"Schedule running: {state_str}")
+        # Create appropriate prompt for the LLM based on source
+        if is_task:
+            system_prompt = (
+                "Only a max 300 character prompt in english for music generator. "
+                "The prompt should be based on the following task (the prompt will result in "
+                "a music track that will be played right now while I am working on this task, "
+                "i need the generated music to motivate me with the task), use your creativity "
+                f"to make the prompt best it can be, here is my task: {base_prompt}. "
+                "Respond only with the prompt."
+            )
         else:
-            self.schedule_status_label.config(text="Schedule not running")
+            system_prompt = (
+                f"Only a max 300 character prompt in english for music generator. "
+                f"This is about what the user wants, use your creativity to make it best it can be: {base_prompt}"
+            )
+        
+        # Generate prompt for music using streaming LLM
+        llm_messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add placeholder message before streaming begins
+        self.append_message("Thinking about your music request...", sender="assistant")
+        
+        # Start thread for streaming to avoid UI freeze
+        self.start_thread(
+            target=self._stream_music_prompt,
+            args=(llm_messages, base_prompt, is_task),
+            thread_name="MusicPromptThread"
+        )
+        
+        # Return True as we've started the process (actual result will be handled in the thread)
+        return True
+
+    def _stream_music_prompt(self, messages, base_prompt, is_task):
+        """Process music prompt generation using async pattern to avoid UI freezing"""
+        # Get current language, model and API key
+        selected_language = self.map_language_to_code(self.language_var.get())
+        selected_model = self.model_var.get()
+        openrouter_api_key = self.openrouter_key
+        
+        # Create appropriate prompt
+        if is_task:
+            user_input = (
+                "Generate a brief, creative, English music prompt (max 300 characters) for a song that "
+                f"would motivate someone working on this task: {base_prompt}. Just provide the prompt, "
+                "no additional explanation."
+            )
+        else:
+            user_input = (
+                "Generate a brief, creative, English music prompt (max 300 characters) for a song based on "
+                f"this request: {base_prompt}. Just provide the prompt, no additional explanation."
+            )
+        
+        # Prepare messages
+        prompt_messages = messages.copy() if messages else []
+        prompt_messages.append({"role": "user", "content": user_input})
+        
+        # Use streaming API directly instead of _handle_normal_chat
+        response_json = self.send_message(
+            messages=prompt_messages,
+            image_path=None,
+            language=selected_language,
+            openrouter_api_key=openrouter_api_key,
+            model=selected_model
+        )
+        
+        # Schedule processing response in main thread
+        self.after(0, lambda: self._process_music_prompt_response(response_json, base_prompt))
+
+    def _process_music_prompt_response(self, response_json, base_prompt):
+        """Process the LLM response for music generation in the main thread"""
+        if not response_json:
+            self.append_message("Failed to generate music prompt.", sender="system")
+            return
+            
+        # Extract text from response
+        try:
+            assistant_response = response_json['choices'][0]['message']['content'].strip()
+            
+            # Process image instructions if present
+            pattern = r'\[CREATE_IMAGE:\s*(.*?)\]'
+            match = re.search(pattern, assistant_response)
+            if match:
+                image_prompt = match.group(1).strip()
+                self.display_generated_image(prompt=image_prompt)
+            
+            # Clean prompt and enforce length limit
+            music_prompt = re.sub(r'\s*\[CREATE_IMAGE:\s*.*?\]', '', assistant_response).strip()
+            if len(music_prompt) > 300:
+                music_prompt = music_prompt[:300]
+                last_space = music_prompt.rfind(' ')
+                if last_space > 0:
+                    music_prompt = music_prompt[:last_space]
+            
+            # Schedule the Mureka API call to run in a background thread
+            self.append_message(f"Creating a song with prompt: {music_prompt}", sender="system")
+            self.start_thread(
+                target=self._call_mureka_and_play,
+                args=(music_prompt,),
+                thread_name="MusicGenThread"
+            )
+        except Exception as e:
+            self.append_message(f"Error processing music prompt: {e}", sender="system")
+
+    def _call_mureka_and_play(self, music_prompt):
+        """Call Mureka API and play music in background thread"""
+        try:
+            songs = self.call_mureka_music_api(prompt=music_prompt)
+            
+            if not songs:
+                self.after(0, lambda: self.append_message("Sorry, I couldn't generate music at this time.", sender="system"))
+                return
+            
+            first_song = songs[0]
+            mp3_url = first_song.get("mp3_url")
+            title = first_song.get("title", "<untitled>")
+            
+            if mp3_url:
+                self.after(0, lambda: self.append_message(f"Here's your generated song: {title}\nNow playing...", sender="system"))
+                self.play_music_from_url(mp3_url)
+            else:
+                self.after(0, lambda: self.append_message("No MP3 URL found in the response.", sender="system"))
+
+            if self.reset_conversation_var.get():
+                self.reset_conversation()
+        except Exception as e:
+            self.after(0, lambda: self.append_message(f"Error generating music: {e}", sender="system"))
+
+    #---------------------------------Task Management---------------------------------
 
     def refresh_tasks_list(self):
         """Refresh the tasks list based on the current filter"""
@@ -5381,7 +5858,7 @@ class ChatAudioApp5(tk.Tk):
         if 0 <= listbox_index < len(matched_indexes):
             return matched_indexes[listbox_index]
         return None
-    
+
     def show_add_task_dialog(self):
         """Show a dialog to add a new task"""
         dialog = tk.Toplevel(self)
@@ -5602,153 +6079,88 @@ class ChatAudioApp5(tk.Tk):
 
         # Mark task as completed and update UI
         def check_llm_tts_completion():
-            if self.tts_queue_completed and self.current_tts_stream_completed:
-                # Generate music as a completion reward after a short delay
-                self.after(2000, lambda: self.generate_and_play_music(task['description'], is_task=True))
+            if self.tts_queue_completed:
+                time.sleep(5)
+                if self.tts_queue_completed:
+                    if self.reset_conversation_var.get():
+                        self.reset_conversation()
+                    self.after(0, lambda: self.generate_and_play_music(task['description'], is_task=True))
+                else:
+                    self.after(2000, check_llm_tts_completion)
             else:
                 self.after(2000, check_llm_tts_completion)                                 
         
         # Schedule task completion after a delay to ensure chat processing is complete
         self.after(2000, check_llm_tts_completion)
-            
 
-    def generate_and_play_music(self, base_prompt, is_task=False):
-        """
-        Unified function to generate and play music based on a prompt with streaming.
-        
-        Args:
-            base_prompt: User input or task description to base music on
-            is_task: Boolean indicating if this is for a task reminder (affects prompt)
-        
-        Returns:
-            Boolean: True if music was successfully played
-        """
-        
-        # Create appropriate prompt for the LLM based on source
-        if is_task:
-            system_prompt = (
-                "Only a max 300 character prompt in english for music generator. "
-                "The prompt should be based on the following task (the prompt will result in "
-                "a music track that will be played right now while I am working on this task, "
-                "i need the generated music to motivate me with the task), use your creativity "
-                f"to make the prompt best it can be, here is my task: {base_prompt}. "
-                "Respond only with the prompt."
-            )
-        else:
-            system_prompt = (
-                f"Only a max 300 character prompt in english for music generator. "
-                f"This is about what the user wants, use your creativity to make it best it can be: {base_prompt}"
-            )
-        
-        # Generate prompt for music using streaming LLM
-        llm_messages = [{"role": "system", "content": system_prompt}]
-        
-        # Add placeholder message before streaming begins
-        self.append_message("Thinking about your music request...", sender="assistant")
-        
-        # Start thread for streaming to avoid UI freeze
-        self.start_thread(
-            target=self._stream_music_prompt,
-            args=(llm_messages, base_prompt, is_task),
-            thread_name="MusicPromptThread"
-        )
-        
-        # Return True as we've started the process (actual result will be handled in the thread)
-        return True
-    
-    def _stream_music_prompt(self, messages, base_prompt, is_task):
-        """Process music prompt generation using async pattern to avoid UI freezing"""
-        # Get current language, model and API key
-        selected_language = self.map_language_to_code(self.language_var.get())
-        selected_model = self.model_var.get()
-        openrouter_api_key = self.openrouter_key
-        
-        # Create appropriate prompt
-        if is_task:
-            user_input = (
-                "Generate a brief, creative, English music prompt (max 300 characters) for a song that "
-                f"would motivate someone working on this task: {base_prompt}. Just provide the prompt, "
-                "no additional explanation."
-            )
-        else:
-            user_input = (
-                "Generate a brief, creative, English music prompt (max 300 characters) for a song based on "
-                f"this request: {base_prompt}. Just provide the prompt, no additional explanation."
-            )
-        
-        # Prepare messages
-        prompt_messages = messages.copy() if messages else []
-        prompt_messages.append({"role": "user", "content": user_input})
-        
-        # Use streaming API directly instead of _handle_normal_chat
-        response_json = self.send_message(
-            messages=prompt_messages,
-            image_path=None,
-            language=selected_language,
-            openrouter_api_key=openrouter_api_key,
-            model=selected_model
-        )
-        
-        # Schedule processing response in main thread
-        self.after(0, lambda: self._process_music_prompt_response(response_json, base_prompt))
-
-    def _process_music_prompt_response(self, response_json, base_prompt):
-        """Process the LLM response for music generation in the main thread"""
-        if not response_json:
-            self.append_message("Failed to generate music prompt.", sender="system")
+    def start_schedule(self):
+        try:
+            work_minutes = int(self.work_entry.get())
+            break_minutes = int(self.break_entry.get())
+            if work_minutes <= 0 or break_minutes <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter positive integers for durations.")
             return
-            
-        # Extract text from response
+        
+        self.work_duration = work_minutes * 60
+        self.break_duration = break_minutes * 60
+        self.schedule_running = True
+        self.current_state = "working"
+        
+        # Add initial work task
+        now = datetime.now()
+        self.task_manager.add_task(
+            description="[SCHEDULE] Start working",
+            due_date=now,
+            priority="High"
+        )
+        self.refresh_tasks_list()
+        self.append_message("Schedule started.", sender="system")
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.update_schedule_display()
+        self.check_due_tasks()  # Immediate check
+
+    def stop_schedule(self):
+        self.schedule_running = False
+        self.current_state = None
+        self.schedule_status_label.config(text="Schedule not running")
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.append_message("Schedule stopped.", sender="system")
+
+    def update_schedule_display(self):
+        if self.schedule_running:
+            state_str = self.current_state if self.current_state else "starting"
+            self.schedule_status_label.config(text=f"Schedule running: {state_str}")
+        else:
+            self.schedule_status_label.config(text="Schedule not running")
+
+    #---------------------------------External tools---------------------------------
+
+    def launch_app2(self):
+        """Launch App2 (PDF extractor) as a separate process with correct paths"""
         try:
-            assistant_response = response_json['choices'][0]['message']['content'].strip()
+            # Get the directory of the current script (main app)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            app2_path = os.path.join(script_dir, "SimplerPDFextract.py")
             
-            # Process image instructions if present
-            pattern = r'\[CREATE_IMAGE:\s*(.*?)\]'
-            match = re.search(pattern, assistant_response)
-            if match:
-                image_prompt = match.group(1).strip()
-                self.display_generated_image(prompt=image_prompt)
-            
-            # Clean prompt and enforce length limit
-            music_prompt = re.sub(r'\s*\[CREATE_IMAGE:\s*.*?\]', '', assistant_response).strip()
-            if len(music_prompt) > 300:
-                music_prompt = music_prompt[:300]
-                last_space = music_prompt.rfind(' ')
-                if last_space > 0:
-                    music_prompt = music_prompt[:last_space]
-            
-            # Schedule the Mureka API call to run in a background thread
-            self.append_message(f"Creating a song with prompt: {music_prompt}", sender="system")
-            self.start_thread(
-                target=self._call_mureka_and_play,
-                args=(music_prompt,),
-                thread_name="MusicGenThread"
-            )
+            # Launch using current Python executable and absolute path
+            subprocess.Popen([sys.executable, app2_path])
+            self.append_message("Launched PDF Extractor", sender="system")
         except Exception as e:
-            self.append_message(f"Error processing music prompt: {e}", sender="system")
+            messagebox.showerror("Error", f"Could not start App2: {e}")
 
-
-
-    def _call_mureka_and_play(self, music_prompt):
-        """Call Mureka API and play music in background thread"""
+    def launch_app3(self):
+        """Launch App3 (Keyboard TTS) with proper paths"""
         try:
-            songs = self.call_mureka_music_api(prompt=music_prompt)
-            
-            if not songs:
-                self.after(0, lambda: self.append_message("Sorry, I couldn't generate music at this time.", sender="system"))
-                return
-            
-            first_song = songs[0]
-            mp3_url = first_song.get("mp3_url")
-            title = first_song.get("title", "<untitled>")
-            
-            if mp3_url:
-                self.after(0, lambda: self.append_message(f"Here's your generated song: {title}\nNow playing...", sender="system"))
-                self.play_music_from_url(mp3_url)
-            else:
-                self.after(0, lambda: self.append_message("No MP3 URL found in the response.", sender="system"))
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            app3_path = os.path.join(script_dir, "keyboardtts.py")
+            subprocess.Popen([sys.executable, app3_path])
+            self.append_message("Launched Keyboard TTS", sender="system")
         except Exception as e:
-            self.after(0, lambda: self.append_message(f"Error generating music: {e}", sender="system"))
+            messagebox.showerror("Error", f"Could not start keyboard TTS: {e}")
 
 # --------------------------- Main Entry Point ---------------------------
 if __name__ == "__main__":
